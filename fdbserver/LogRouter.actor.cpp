@@ -18,20 +18,20 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
 #include "flow/ActorCollection.h"
-#include "fdbclient/NativeAPI.h"
-#include "WorkerInterface.h"
-#include "WaitFailure.h"
-#include "Knobs.h"
-#include "ServerDBInfo.h"
-#include "LogSystem.h"
+#include "fdbclient/NativeAPI.actor.h"
+#include "fdbserver/WorkerInterface.actor.h"
+#include "fdbserver/WaitFailure.h"
+#include "fdbserver/Knobs.h"
+#include "fdbserver/ServerDBInfo.h"
+#include "fdbserver/LogSystem.h"
 #include "fdbclient/SystemData.h"
-#include "ApplyMetadataMutation.h"
-#include "RecoveryState.h"
+#include "fdbserver/ApplyMetadataMutation.h"
+#include "fdbserver/RecoveryState.h"
 #include "fdbclient/Atomic.h"
 #include "flow/TDMetric.actor.h"
 #include "flow/Stats.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
 struct LogRouterData {
 	struct TagData : NonCopyable, public ReferenceCounted<TagData> {
@@ -42,8 +42,8 @@ struct LogRouterData {
 
 		TagData( Tag tag, Version popped, Version durableKnownCommittedVersion ) : tag(tag), popped(popped), durableKnownCommittedVersion(durableKnownCommittedVersion) {}
 
-		TagData(TagData&& r) noexcept(true) : version_messages(std::move(r.version_messages)), tag(r.tag), popped(r.popped), durableKnownCommittedVersion(r.durableKnownCommittedVersion) {}
-		void operator= (TagData&& r) noexcept(true) {
+		TagData(TagData&& r) BOOST_NOEXCEPT : version_messages(std::move(r.version_messages)), tag(r.tag), popped(r.popped), durableKnownCommittedVersion(r.durableKnownCommittedVersion) {}
+		void operator= (TagData&& r) BOOST_NOEXCEPT {
 			version_messages = std::move(r.version_messages);
 			tag = r.tag;
 			popped = r.popped;
@@ -63,7 +63,7 @@ struct LogRouterData {
 					self->version_messages.pop_front();
 				}
 
-				Void _ = wait(yield(taskID));
+				wait(yield(taskID));
 			}
 
 			return Void();
@@ -80,10 +80,15 @@ struct LogRouterData {
 	NotifiedVersion minPopped;
 	Version startVersion;
 	Version minKnownCommittedVersion;
+	Version poppedVersion;
 	Deque<std::pair<Version, Standalone<VectorRef<uint8_t>>>> messageBlocks;
 	Tag routerTag;
 	bool allowPops;
 	LogSet logSet;
+	bool foundEpochEnd;
+
+	CounterCollection cc;
+	Future<Void> logger;
 
 	std::vector<Reference<TagData>> tag_data; //we only store data for the remote tag locality
 
@@ -102,7 +107,9 @@ struct LogRouterData {
 		return newTagData;
 	}
 
-	LogRouterData(UID dbgid, InitializeLogRouterRequest req) : dbgid(dbgid), routerTag(req.routerTag), logSystem(new AsyncVar<Reference<ILogSystem>>()), version(req.startVersion-1), minPopped(req.startVersion-1), startVersion(req.startVersion), allowPops(false), minKnownCommittedVersion(0) {
+	LogRouterData(UID dbgid, InitializeLogRouterRequest req) : dbgid(dbgid), routerTag(req.routerTag), logSystem(new AsyncVar<Reference<ILogSystem>>()), 
+	  version(req.startVersion-1), minPopped(0), startVersion(req.startVersion), allowPops(false), minKnownCommittedVersion(0), poppedVersion(0), foundEpochEnd(false),
+		cc("LogRouter", dbgid.toString()) {
 		//setup just enough of a logSet to be able to call getPushLocations
 		logSet.logServers.resize(req.tLogLocalities.size());
 		logSet.tLogPolicy = req.tLogPolicy;
@@ -116,6 +123,12 @@ struct LogRouterData {
 				tagData = createTagData(tag, 0, 0);
 			}
 		}
+
+		specialCounter(cc, "Version", [this](){return this->version.get(); });
+		specialCounter(cc, "MinPopped", [this](){return this->minPopped.get(); });
+		specialCounter(cc, "MinKnownCommittedVersion", [this](){ return this->minKnownCommittedVersion; });
+		specialCounter(cc, "PoppedVersion", [this](){ return this->poppedVersion; });
+		logger = traceCounters("LogRouterMetrics", dbgid, SERVER_KNOBS->WORKER_LOGGING_INTERVAL, &cc, "LogRouterMetrics");
 	}
 };
 
@@ -169,6 +182,34 @@ void commitMessages( LogRouterData* self, Version version, const std::vector<Tag
 	self->messageBlocks.push_back( std::make_pair(version, block) );
 }
 
+ACTOR Future<Void> waitForVersion( LogRouterData *self, Version ver ) {
+	// The only time the log router should allow a gap in versions larger than MAX_READ_TRANSACTION_LIFE_VERSIONS is when processing epoch end.
+	// Since one set of log routers is created per generation of transaction logs, the gap caused by epoch end will be within MAX_VERSIONS_IN_FLIGHT of the log routers start version.
+	if(self->version.get() < self->startVersion) {
+		if(ver > self->startVersion) {
+			self->version.set(self->startVersion);
+			wait(self->minPopped.whenAtLeast(self->version.get()));
+		}
+		return Void();
+	}
+	if(!self->foundEpochEnd) {
+		wait(self->minPopped.whenAtLeast(std::min(self->version.get(), ver - SERVER_KNOBS->MAX_READ_TRANSACTION_LIFE_VERSIONS)));
+	} else {
+		while(self->minPopped.get() + SERVER_KNOBS->MAX_READ_TRANSACTION_LIFE_VERSIONS < ver) {
+			if(self->minPopped.get() + SERVER_KNOBS->MAX_READ_TRANSACTION_LIFE_VERSIONS > self->version.get()) {
+				self->version.set( self->minPopped.get() + SERVER_KNOBS->MAX_READ_TRANSACTION_LIFE_VERSIONS );
+				wait(yield(TaskTLogCommit));
+			} else {
+				wait(self->minPopped.whenAtLeast((self->minPopped.get()+1)));
+			}
+		}
+	}
+	if(ver >= self->startVersion + SERVER_KNOBS->MAX_VERSIONS_IN_FLIGHT) {
+		self->foundEpochEnd = true;
+	}
+	return Void();
+}
+
 ACTOR Future<Void> pullAsyncData( LogRouterData *self ) {
 	state Future<Void> dbInfoChange = Void();
 	state Reference<ILogSystem::IPeekCursor> r;
@@ -180,10 +221,10 @@ ACTOR Future<Void> pullAsyncData( LogRouterData *self ) {
 	loop {
 		loop {
 			choose {
-				when(Void _ = wait( r ? r->getMore(TaskTLogCommit) : Never() ) ) {
+				when(wait( r ? r->getMore(TaskTLogCommit) : Never() ) ) {
 					break;
 				}
-				when( Void _ = wait( dbInfoChange ) ) { //FIXME: does this actually happen?
+				when( wait( dbInfoChange ) ) { //FIXME: does this actually happen?
 					if(r) tagPopped = std::max(tagPopped, r->popped());
 					if( self->logSystem->get() )
 						r = self->logSystem->get()->peekLogRouter( self->dbgid, tagAt, self->routerTag );
@@ -203,10 +244,11 @@ ACTOR Future<Void> pullAsyncData( LogRouterData *self ) {
 			if (!foundMessage || r->version().version != ver) {
 				ASSERT(r->version().version > lastVer);
 				if (ver) {
-					Void _ = wait(self->minPopped.whenAtLeast(std::min(self->version.get(), ver - SERVER_KNOBS->MAX_READ_TRANSACTION_LIFE_VERSIONS)));
+					wait( waitForVersion(self, ver) );
+
 					commitMessages(self, ver, messages);
 					self->version.set( ver );
-					Void _ = wait(yield(TaskTLogCommit));
+					wait(yield(TaskTLogCommit));
 					//TraceEvent("LogRouterVersion").detail("Ver",ver);
 				}
 				lastVer = ver;
@@ -216,9 +258,10 @@ ACTOR Future<Void> pullAsyncData( LogRouterData *self ) {
 				if (!foundMessage) {
 					ver--; //ver is the next possible version we will get data for
 					if(ver > self->version.get()) {
-						Void _ = wait(self->minPopped.whenAtLeast(std::min(self->version.get(), ver - SERVER_KNOBS->MAX_READ_TRANSACTION_LIFE_VERSIONS)));
+						wait( waitForVersion(self, ver) );
+
 						self->version.set( ver );
-						Void _ = wait(yield(TaskTLogCommit));
+						wait(yield(TaskTLogCommit));
 					}
 					break;
 				}
@@ -284,7 +327,7 @@ Version poppedVersion( LogRouterData* self, Tag tag) {
 ACTOR Future<Void> logRouterPeekMessages( LogRouterData* self, TLogPeekRequest req ) {
 	state BinaryWriter messages(Unversioned());
 
-	//TraceEvent("LogRouterPeek1", self->dbgid).detail("From", req.reply.getEndpoint().address).detail("Ver", self->version.get()).detail("Begin", req.begin);
+	//TraceEvent("LogRouterPeek1", self->dbgid).detail("From", req.reply.getEndpoint().getPrimaryAddress()).detail("Ver", self->version.get()).detail("Begin", req.begin);
 	if( req.returnIfBlocked && self->version.get() < req.begin ) {
 		//TraceEvent("LogRouterPeek2", self->dbgid);
 		req.reply.sendError(end_of_stream());
@@ -292,8 +335,8 @@ ACTOR Future<Void> logRouterPeekMessages( LogRouterData* self, TLogPeekRequest r
 	}
 
 	if( self->version.get() < req.begin ) {
-		Void _ = wait( self->version.whenAtLeast( req.begin ) );
-		Void _ = wait( delay(SERVER_KNOBS->TLOG_PEEK_DELAY, g_network->getCurrentTask()) );
+		wait( self->version.whenAtLeast( req.begin ) );
+		wait( delay(SERVER_KNOBS->TLOG_PEEK_DELAY, g_network->getCurrentTask()) );
 	}
 
 	Version poppedVer = poppedVersion(self, req.tag);
@@ -311,8 +354,8 @@ ACTOR Future<Void> logRouterPeekMessages( LogRouterData* self, TLogPeekRequest r
 
 	TLogPeekReply reply;
 	reply.maxKnownVersion = self->version.get();
-	reply.minKnownCommittedVersion = self->minKnownCommittedVersion;
-	reply.messages = messages.toStringRef();
+	reply.minKnownCommittedVersion = self->poppedVersion;
+	reply.messages = messages.toValue();
 	reply.popped = self->minPopped.get() >= self->startVersion ? self->minPopped.get() : 0;
 	reply.end = endVersion;
 
@@ -328,7 +371,7 @@ ACTOR Future<Void> logRouterPop( LogRouterData* self, TLogPopRequest req ) {
 	} else if (req.to > tagData->popped) {
 		tagData->popped = req.to;
 		tagData->durableKnownCommittedVersion = req.durableKnownCommittedVersion;
-		Void _ = wait(tagData->eraseMessagesBefore( req.to, self, TaskTLogPop ));
+		wait(tagData->eraseMessagesBefore( req.to, self, TaskTLogPop ));
 	}
 
 	state Version minPopped = std::numeric_limits<Version>::max();
@@ -342,11 +385,12 @@ ACTOR Future<Void> logRouterPop( LogRouterData* self, TLogPopRequest req ) {
 
 	while(!self->messageBlocks.empty() && self->messageBlocks.front().first < minPopped) {
 		self->messageBlocks.pop_front();
-		Void _ = wait(yield(TaskTLogPop));
+		wait(yield(TaskTLogPop));
 	}
 
+	self->poppedVersion = std::min(minKnownCommittedVersion, self->minKnownCommittedVersion);
 	if(self->logSystem->get() && self->allowPops) {
-		self->logSystem->get()->pop(std::min(minKnownCommittedVersion, self->minKnownCommittedVersion), self->routerTag);
+		self->logSystem->get()->pop(self->poppedVersion, self->routerTag);
 	}
 	req.reply.send(Void());
 	self->minPopped.set(std::max(minPopped, self->minPopped.get()));
@@ -366,7 +410,7 @@ ACTOR Future<Void> logRouterCore(
 	addActor.send( pullAsyncData(&logRouterData) );
 
 	loop choose {
-		when( Void _ = wait( dbInfoChange ) ) {
+		when( wait( dbInfoChange ) ) {
 			dbInfoChange = db->onChange();
 			logRouterData.allowPops = db->get().recoveryState == RecoveryState::FULLY_RECOVERED;
 			logRouterData.logSystem->set(ILogSystem::fromServerDBInfo( logRouterData.dbgid, db->get(), true ));
@@ -377,7 +421,7 @@ ACTOR Future<Void> logRouterCore(
 		when( TLogPopRequest req = waitNext( interf.popMessages.getFuture() ) ) {
 			addActor.send( logRouterPop( &logRouterData, req ) );
 		}
-		when (Void _ = wait(error)) {}
+		when (wait(error)) {}
 	}
 }
 
@@ -405,7 +449,7 @@ ACTOR Future<Void> checkRemoved(Reference<AsyncVar<ServerDBInfo>> db, uint64_t r
 		if (isDisplaced) {
 			throw worker_removed();
 		}
-		Void _ = wait(db->onChange());
+		wait(db->onChange());
 	}
 }
 
@@ -418,8 +462,8 @@ ACTOR Future<Void> logRouter(
 		TraceEvent("LogRouterStart", interf.id()).detail("Start", req.startVersion).detail("Tag", req.routerTag.toString()).detail("Localities", req.tLogLocalities.size()).detail("Locality", req.locality);
 		state Future<Void> core = logRouterCore(interf, req, db);
 		loop choose{
-			when(Void _ = wait(core)) { return Void(); }
-			when(Void _ = wait(checkRemoved(db, req.recoveryCount, interf))) {}
+			when(wait(core)) { return Void(); }
+			when(wait(checkRemoved(db, req.recoveryCount, interf))) {}
 		}
 	}
 	catch (Error& e) {

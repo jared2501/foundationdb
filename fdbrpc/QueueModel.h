@@ -23,7 +23,7 @@
 #pragma once
 
 #include "flow/flow.h"
-#include "Smoother.h"
+#include "fdbrpc/Smoother.h"
 #include "flow/Knobs.h"
 #include "flow/ActorCollection.h"
 
@@ -59,7 +59,7 @@ public:
 		laggingRequests.cancel();
 	}
 private:
-	std::map<uint64_t, QueueData> data;
+	std::unordered_map<uint64_t, QueueData> data;
 };
 
 /* old queue model

@@ -18,15 +18,16 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
-#include "fdbclient/NativeAPI.h"
-#include "fdbserver/TesterInterface.h"
-#include "fdbclient/ManagementAPI.h"
-#include "workloads.h"
+#include "fdbclient/NativeAPI.actor.h"
+#include "fdbserver/TesterInterface.actor.h"
+#include "fdbclient/ManagementAPI.actor.h"
+#include "fdbserver/workloads/workloads.actor.h"
 #include "fdbrpc/simulator.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
 // "ssd" is an alias to the preferred type which skews the random distribution toward it but that's okay.
-static const char* storeTypes[] = { "ssd", "ssd-1", "ssd-2", "memory" };
+static const char* storeTypes[] = { "ssd", "ssd-1", "ssd-2", "memory", "memory-1", "memory-2" };
+static const char* logTypes[] = { "log_engine:=1", "log_engine:=2", "log_spill:=1", "log_spill:=2", "log_version:=2", "log_version:=3" };
 static const char* redundancies[] = { "single", "double", "triple" };
 
 std::string generateRegions() {
@@ -235,15 +236,20 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 		return StringRef(format("DestroyDB%d", dbIndex));
 	}
 
+	static Future<ConfigurationResult::Type> IssueConfigurationChange( Database cx, const std::string& config, bool force ) {
+		printf("Issuing configuration change: %s\n", config.c_str());
+		return changeConfig(cx, config, force);
+	}
+
 	ACTOR Future<Void> _setup( Database cx, ConfigureDatabaseWorkload *self ) {
-		ConfigurationResult::Type _ = wait( changeConfig( cx, "single", true ) );
+		wait(success( changeConfig( cx, "single", true ) ));
 		return Void();
 	}
 
 	ACTOR Future<Void> _start( ConfigureDatabaseWorkload *self, Database cx ) {
 		if( self->clientId == 0 ) {
 			self->clients.push_back( timeout( self->singleDB( self, cx ), self->testDuration, Void() ) );
-			Void _ = wait( waitForAll( self->clients ) );
+			wait( waitForAll( self->clients ) );
 		}
 		return Void();
 	}
@@ -261,21 +267,21 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 			if(g_simulator.speedUpSimulation) {
 				return Void();
 			}
-			state int randomChoice = g_random->randomInt(0, 6);
+			state int randomChoice = g_random->randomInt(0, 7);
 			if( randomChoice == 0 ) {
 				double waitDuration = 3.0 * g_random->random01();
 				//TraceEvent("ConfigureTestWaitAfter").detail("WaitDuration",waitDuration);
-				Void _ = wait( delay( waitDuration ) );
+				wait( delay( waitDuration ) );
 			}
 			else if( randomChoice == 1 ) {
 				tr = Transaction( cx );
 				loop {
 					try {
 						tr.clear( normalKeys );
-						Void _ = wait( tr.commit() );
+						wait( tr.commit() );
 						break;
 					} catch( Error &e ) {
-						Void _ = wait( tr.onError(e) );
+						wait( tr.onError(e) );
 					}
 				}
 			}
@@ -296,16 +302,16 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 								uint64_t nextVal = val.present() ? valueToUInt64( val.get() ) + 1 : 0;
 								tr.set( randomKey, format( "%016llx", nextVal ) );
 							}
-							Void _ = wait( tr.commit() );
+							wait( tr.commit() );
 							amtLoaded += 10;
 							break;
 						}
 						catch( Error& e ) {
-							Void _ = wait( tr.onError( e ) );
+							wait( tr.onError( e ) );
 							++self->retries;
 						}
 					}
-					Void _ = wait( delay( 0.1 ) );
+					wait( delay( 0.1 ) );
 				}
 
 				//TraceEvent("ConfigureTestLoadData").detail("LoadTime", now() - startTime).detail("AmountLoaded",amtLoaded);
@@ -329,7 +335,7 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 				if (g_random->random01() < 0.5) config += " proxies=" + format("%d", randomRoleNumber());
 				if (g_random->random01() < 0.5) config += " resolvers=" + format("%d", randomRoleNumber());
 
-				ConfigurationResult::Type _ = wait( changeConfig( cx, config, false ) );
+				wait(success( IssueConfigurationChange( cx, config, false ) ));
 
 				//TraceEvent("ConfigureTestConfigureEnd").detail("NewConfig", newConfig);
 			}
@@ -338,11 +344,15 @@ struct ConfigureDatabaseWorkload : TestWorkload {
 				auto ch = autoQuorumChange();
 				if (g_random->randomInt(0,2))
 					ch = nameQuorumChange( format("NewName%d", g_random->randomInt(0,100)), ch );
-				CoordinatorsResult::Type _ = wait( changeQuorum( cx, ch ) );
+				wait(success( changeQuorum( cx, ch ) ));
 				//TraceEvent("ConfigureTestConfigureEnd").detail("NewQuorum", s);
 			}
 			else if ( randomChoice == 5) {
-				ConfigurationResult::Type _ = wait( changeConfig( cx, storeTypes[g_random->randomInt( 0, sizeof(storeTypes)/sizeof(storeTypes[0]))], true ) );
+				wait(success( IssueConfigurationChange( cx, storeTypes[g_random->randomInt( 0, sizeof(storeTypes)/sizeof(storeTypes[0]))], true ) ));
+			}
+			else if ( randomChoice == 6 ) {
+				// Some configurations will be invalid, and that's fine.
+				wait(success( IssueConfigurationChange( cx, logTypes[g_random->randomInt( 0, sizeof(logTypes)/sizeof(logTypes[0]))], false ) ));
 			}
 			else {
 				ASSERT(false);

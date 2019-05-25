@@ -23,12 +23,12 @@
 
 #pragma once
 
-#include "ITLSPlugin.h"
-#include "ReferenceCounted.h"
+#include "fdbrpc/ITLSPlugin.h"
+#include "flow/FastRef.h"
 
-#include "FDBLibTLSPolicy.h"
-#include "FDBLibTLSVerify.h"
-#include "IRandom.h"
+#include "FDBLibTLS/FDBLibTLSPolicy.h"
+#include "FDBLibTLS/FDBLibTLSVerify.h"
+#include "flow/IRandom.h"
 
 #include <tls.h>
 
@@ -61,6 +61,7 @@ struct FDBLibTLSSession : ITLSSession, ReferenceCounted<FDBLibTLSSession> {
 	bool handshake_completed;
 
 	UID uid;
+	double lastVerifyFailureLogged;
 };
 
 #endif /* FDB_LIBTLS_SESSION_H */

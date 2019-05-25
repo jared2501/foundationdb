@@ -18,16 +18,17 @@
  * limitations under the License.
  */
 
-#include "BlobStore.h"
+#include "fdbclient/BlobStore.h"
 
 #include "fdbclient/md5/md5.h"
 #include "fdbclient/libb64/encode.h"
 #include "fdbclient/sha1/SHA1.h"
-#include "time.h"
+#include <time.h>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include "fdbrpc/IAsyncFile.h"
 #include "rapidxml/rapidxml.hpp"
+#include "flow/actorcompiler.h" // has to be last include
 
 using namespace rapidxml;
 
@@ -146,10 +147,14 @@ Reference<BlobStoreEndpoint> BlobStoreEndpoint::fromString(std::string const &ur
 		StringRef t(url);
 		StringRef prefix = t.eat("://");
 		if(prefix != LiteralStringRef("blobstore"))
-			throw std::string("Invalid blobstore URL.");
-		StringRef cred   =   t.eat("@");
-		StringRef hostPort = t.eat("/");
-		StringRef resource = t.eat("?");
+			throw format("Invalid blobstore URL prefix '%s'", prefix.toString().c_str());
+		StringRef cred = t.eat("@");
+		uint8_t foundSeparator = 0;
+		StringRef hostPort = t.eatAny("/?", &foundSeparator);
+		StringRef resource;
+		if(foundSeparator == '/') {
+			 resource = t.eat("?");
+		}
 
 		// hostPort is at least a host or IP address, optionally followed by :portNumber or :serviceName
 		StringRef h(hostPort);
@@ -160,12 +165,31 @@ Reference<BlobStoreEndpoint> BlobStoreEndpoint::fromString(std::string const &ur
 		StringRef service = h.eat();
 
 		BlobKnobs knobs;
+		HTTP::Headers extraHeaders;
 		while(1) {
 			StringRef name = t.eat("=");
 			if(name.size() == 0)
 				break;
 			StringRef value = t.eat("&");
 
+			// Special case for header
+			if(name == LiteralStringRef("header")) {
+				StringRef originalValue = value;
+				StringRef headerFieldName = value.eat(":");
+				StringRef headerFieldValue = value;
+				if(headerFieldName.size() == 0 || headerFieldValue.size() == 0) {
+					throw format("'%s' is not a valid value for '%s' parameter.  Format is <FieldName>:<FieldValue> where strings are not empty.", originalValue.toString().c_str(), name.toString().c_str());
+				}
+				std::string &fieldValue = extraHeaders[headerFieldName.toString()];
+				// RFC 2616 section 4.2 says header field names can repeat but only if it is valid to concatenate their values with comma separation
+				if(!fieldValue.empty()) {
+					fieldValue.append(",");
+				}
+				fieldValue.append(headerFieldValue.toString());
+				continue;
+			}
+
+			// See if the parameter is a knob
 			// First try setting a dummy value (all knobs are currently numeric) just to see if this parameter is known to BlobStoreEndpoint.
 			// If it is, then we will set it to a good value or throw below, so the dummy set has no bad side effects.
 			bool known = knobs.set(name, 0);
@@ -196,7 +220,7 @@ Reference<BlobStoreEndpoint> BlobStoreEndpoint::fromString(std::string const &ur
 		StringRef key = c.eat(":");
 		StringRef secret = c.eat();
 
-		return Reference<BlobStoreEndpoint>(new BlobStoreEndpoint(host.toString(), service.toString(), key.toString(), secret.toString(), knobs));
+		return Reference<BlobStoreEndpoint>(new BlobStoreEndpoint(host.toString(), service.toString(), key.toString(), secret.toString(), knobs, extraHeaders));
 
 	} catch(std::string &err) {
 		if(error != nullptr)
@@ -206,7 +230,7 @@ Reference<BlobStoreEndpoint> BlobStoreEndpoint::fromString(std::string const &ur
 	}
 }
 
-std::string BlobStoreEndpoint::getResourceURL(std::string resource) {
+std::string BlobStoreEndpoint::getResourceURL(std::string resource, std::string params) {
 	std::string hostPort = host;
 	if(!service.empty()) {
 		hostPort.append(":");
@@ -219,14 +243,48 @@ std::string BlobStoreEndpoint::getResourceURL(std::string resource) {
 		s = std::string(":") + secret;
 
 	std::string r = format("blobstore://%s%s@%s/%s", key.c_str(), s.c_str(), hostPort.c_str(), resource.c_str());
-	std::string p = knobs.getURLParameters();
-	if(!p.empty())
-		r.append("?").append(p);
+
+	// Get params that are deviations from knob defaults
+	std::string knobParams = knobs.getURLParameters();
+	if(!knobParams.empty()) {
+		if(!params.empty()) {
+			params.append("&");
+		}
+		params.append(knobParams);
+	}
+
+	for(auto &kv : extraHeaders) {
+		if(!params.empty()) {
+			params.append("&");
+		}
+		params.append("header=");
+		params.append(HTTP::urlEncode(kv.first));
+		params.append(":");
+		params.append(HTTP::urlEncode(kv.second));
+	}
+
+	if(!params.empty())
+		r.append("?").append(params);
+
 	return r;
 }
 
+ACTOR Future<bool> bucketExists_impl(Reference<BlobStoreEndpoint> b, std::string bucket) {
+	wait(b->requestRateRead->getAllowance(1));
+
+	std::string resource = std::string("/") + bucket;
+	HTTP::Headers headers;
+
+	Reference<HTTP::Response> r = wait(b->doRequest("HEAD", resource, headers, NULL, 0, {200, 404}));
+	return r->code == 200;
+}
+
+Future<bool> BlobStoreEndpoint::bucketExists(std::string const &bucket) {
+	return bucketExists_impl(Reference<BlobStoreEndpoint>::addRef(this), bucket);
+}
+
 ACTOR Future<bool> objectExists_impl(Reference<BlobStoreEndpoint> b, std::string bucket, std::string object) {
-	Void _ = wait(b->requestRateRead->getAllowance(1));
+	wait(b->requestRateRead->getAllowance(1));
 
 	std::string resource = std::string("/") + bucket + "/" + object;
 	HTTP::Headers headers;
@@ -240,12 +298,21 @@ Future<bool> BlobStoreEndpoint::objectExists(std::string const &bucket, std::str
 }
 
 ACTOR Future<Void> deleteObject_impl(Reference<BlobStoreEndpoint> b, std::string bucket, std::string object) {
-	Void _ = wait(b->requestRateDelete->getAllowance(1));
+	wait(b->requestRateDelete->getAllowance(1));
 
 	std::string resource = std::string("/") + bucket + "/" + object;
 	HTTP::Headers headers;
+	// 200 or 204 means object successfully deleted, 404 means it already doesn't exist, so any of those are considered successful
 	Reference<HTTP::Response> r = wait(b->doRequest("DELETE", resource, headers, NULL, 0, {200, 204, 404}));
-	// 200 means object deleted, 404 means it doesn't exist already, so either success code passed above is fine.
+
+	// But if the object already did not exist then the 'delete' is assumed to be successful but a warning is logged.
+	if(r->code == 404) {
+		TraceEvent(SevWarnAlways, "BlobStoreEndpointDeleteObjectMissing")
+			.detail("Host", b->host)
+			.detail("Bucket", bucket)
+			.detail("Object", object);
+	}
+
 	return Void();
 }
 
@@ -268,7 +335,7 @@ ACTOR Future<Void> deleteRecursively_impl(Reference<BlobStoreEndpoint> b, std::s
 		loop {
 			choose {
 				// Throw if done throws, otherwise don't stop until end_of_stream
-				when(Void _ = wait(done)) {
+				when(wait(done)) {
 					done = Never();
 				}
 
@@ -286,7 +353,7 @@ ACTOR Future<Void> deleteRecursively_impl(Reference<BlobStoreEndpoint> b, std::s
 
 			// This is just a precaution to avoid having too many outstanding delete actors waiting to run
 			while(deleteFutures.size() > CLIENT_KNOBS->BLOBSTORE_CONCURRENT_REQUESTS) {
-				Void _ = wait(deleteFutures.front());
+				wait(deleteFutures.front());
 				deleteFutures.pop_front();
 			}
 		}
@@ -296,7 +363,7 @@ ACTOR Future<Void> deleteRecursively_impl(Reference<BlobStoreEndpoint> b, std::s
 	}
 
 	while(deleteFutures.size() > 0) {
-		Void _ = wait(deleteFutures.front());
+		wait(deleteFutures.front());
 		deleteFutures.pop_front();
 	}
 
@@ -308,11 +375,14 @@ Future<Void> BlobStoreEndpoint::deleteRecursively(std::string const &bucket, std
 }
 
 ACTOR Future<Void> createBucket_impl(Reference<BlobStoreEndpoint> b, std::string bucket) {
-	Void _ = wait(b->requestRateWrite->getAllowance(1));
+	wait(b->requestRateWrite->getAllowance(1));
 
-	std::string resource = std::string("/") + bucket;
-	HTTP::Headers headers;
-	Reference<HTTP::Response> r = wait(b->doRequest("PUT", resource, headers, NULL, 0, {200, 409}));
+	bool exists = wait(b->bucketExists(bucket));
+	if(!exists) {
+		std::string resource = std::string("/") + bucket;
+		HTTP::Headers headers;
+		Reference<HTTP::Response> r = wait(b->doRequest("PUT", resource, headers, NULL, 0, {200, 409}));
+	}
 	return Void();
 }
 
@@ -321,7 +391,7 @@ Future<Void> BlobStoreEndpoint::createBucket(std::string const &bucket) {
 }
 
 ACTOR Future<int64_t> objectSize_impl(Reference<BlobStoreEndpoint> b, std::string bucket, std::string object) {
-	Void _ = wait(b->requestRateRead->getAllowance(1));
+	wait(b->requestRateRead->getAllowance(1));
 
 	std::string resource = std::string("/") + bucket + "/" + object;
 	HTTP::Headers headers;
@@ -379,7 +449,7 @@ ACTOR Future<Void> updateSecret_impl(Reference<BlobStoreEndpoint> b) {
 	for(auto &f : *pFiles)
 		reads.push_back(tryReadJSONFile(f));
 
-	Void _ = wait(waitForAll(reads));
+	wait(waitForAll(reads));
 
 	std::string key = b->key + "@" + b->host;
 
@@ -443,7 +513,7 @@ ACTOR Future<BlobStoreEndpoint::ReusableConnection> connect_impl(Reference<BlobS
 		.detail("ExpiresIn", b->knobs.max_connection_life);
 
 	if(b->lookupSecret)
-		Void _ = wait(b->updateSecret());
+		wait(b->updateSecret());
 
 	return BlobStoreEndpoint::ReusableConnection({conn, now() + b->knobs.max_connection_life});
 }
@@ -468,7 +538,17 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<BlobStoreEndpoi
 	headers["Content-Length"] = format("%d", contentLen);
 	headers["Host"] = bstore->host;
 	headers["Accept"] = "application/xml";
-	Void _ = wait(bstore->concurrentRequests.take());
+
+	// Merge extraHeaders into headers
+	for(auto &kv : bstore->extraHeaders) {
+		std::string &fieldValue = headers[kv.first];
+		if(!fieldValue.empty()) {
+			fieldValue.append(",");
+		}
+		fieldValue.append(kv.second);
+	}
+
+	wait(bstore->concurrentRequests.take());
 	state FlowLock::Releaser globalReleaser(bstore->concurrentRequests, 1);
 
 	state int maxTries = std::min(bstore->knobs.request_tries, bstore->knobs.connect_tries);
@@ -479,14 +559,15 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<BlobStoreEndpoi
 		state Optional<Error> err;
 		state Optional<NetworkAddress> remoteAddress;
 		state bool connectionEstablished = false;
+		state Reference<HTTP::Response> r;
 
 		try {
 			// Start connecting
 			Future<BlobStoreEndpoint::ReusableConnection> frconn = bstore->connect();
 
 			// Make a shallow copy of the queue by calling addref() on each buffer in the chain and then prepending that chain to contentCopy
+			contentCopy.discardAll();
 			if(pContent != nullptr) {
-				contentCopy.discardAll();
 				PacketBuffer *pFirst = pContent->getUnsent();
 				PacketBuffer *pLast = nullptr;
 				for(PacketBuffer *p = pFirst; p != nullptr; p = p->nextPacketBuffer()) {
@@ -507,8 +588,9 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<BlobStoreEndpoi
 			// when a new connection is established and setAuthHeaders() would need the updated secret.
 			bstore->setAuthHeaders(verb, resource, headers);
 			remoteAddress = rconn.conn->getPeerAddress();
-			Void _ = wait(bstore->requestRate->getAllowance(1));
-			state Reference<HTTP::Response> r = wait(timeoutError(HTTP::doRequest(rconn.conn, verb, resource, headers, &contentCopy, contentLen, bstore->sendRate, &bstore->s_stats.bytes_sent, bstore->recvRate), bstore->knobs.request_timeout));
+			wait(bstore->requestRate->getAllowance(1));
+			Reference<HTTP::Response> _r = wait(timeoutError(HTTP::doRequest(rconn.conn, verb, resource, headers, &contentCopy, contentLen, bstore->sendRate, &bstore->s_stats.bytes_sent, bstore->recvRate), bstore->knobs.request_timeout));
+			r = _r;
 
 			// Since the response was parsed successfully (which is why we are here) reuse the connection unless we received the "Connection: close" header.
 			if(r->headers["Connection"] != "close")
@@ -585,7 +667,7 @@ ACTOR Future<Reference<HTTP::Response>> doRequest_impl(Reference<BlobStoreEndpoi
 
 			// Log the delay then wait.
 			event.detail("RetryDelay", delay);
-			Void _ = wait(::delay(delay));
+			wait(::delay(delay));
 		}
 		else {
 			// We can't retry, so throw something.
@@ -637,7 +719,7 @@ ACTOR Future<Void> listBucketStream_impl(Reference<BlobStoreEndpoint> bstore, st
 	state std::vector<Future<Void>> subLists;
 
 	while(more) {
-		Void _ = wait(bstore->concurrentLists.take());
+		wait(bstore->concurrentLists.take());
 		state FlowLock::Releaser listReleaser(bstore->concurrentLists, 1);
 
 		HTTP::Headers headers;
@@ -742,7 +824,7 @@ ACTOR Future<Void> listBucketStream_impl(Reference<BlobStoreEndpoint> bstore, st
 		}
 	}
 
-	Void _ = wait(waitForAll(subLists));
+	wait(waitForAll(subLists));
 
 	return Void();
 }
@@ -765,7 +847,7 @@ ACTOR Future<BlobStoreEndpoint::ListResult> listBucket_impl(Reference<BlobStoreE
 		loop {
 			choose {
 				// Throw if done throws, otherwise don't stop until end_of_stream
-				when(Void _ = wait(done)) {
+				when(wait(done)) {
 					done = Never();
 				}
 
@@ -860,7 +942,7 @@ void BlobStoreEndpoint::setAuthHeaders(std::string const &verb, std::string cons
 }
 
 ACTOR Future<std::string> readEntireFile_impl(Reference<BlobStoreEndpoint> bstore, std::string bucket, std::string object) {
-	Void _ = wait(bstore->requestRateRead->getAllowance(1));
+	wait(bstore->requestRateRead->getAllowance(1));
 
 	std::string resource = std::string("/") + bucket + "/" + object;
 	HTTP::Headers headers;
@@ -878,8 +960,8 @@ ACTOR Future<Void> writeEntireFileFromBuffer_impl(Reference<BlobStoreEndpoint> b
 	if(contentLen > bstore->knobs.multipart_max_part_size)
 		throw file_too_large();
 
-	Void _ = wait(bstore->requestRateWrite->getAllowance(1));
-	Void _ = wait(bstore->concurrentUploads.take());
+	wait(bstore->requestRateWrite->getAllowance(1));
+	wait(bstore->concurrentUploads.take());
 	state FlowLock::Releaser uploadReleaser(bstore->concurrentUploads, 1);
 
 	std::string resource = std::string("/") + bucket + "/" + object;
@@ -904,7 +986,7 @@ ACTOR Future<Void> writeEntireFile_impl(Reference<BlobStoreEndpoint> bstore, std
 
 	// Yield because we may have just had to copy several MB's into packet buffer chain and next we have to calculate an MD5 sum of it.
 	// TODO:  If this actor is used to send large files then combine the summing and packetization into a loop with a yield() every 20k or so.
-	Void _ = wait(yield());
+	wait(yield());
 
 	MD5_CTX sum;
 	::MD5_Init(&sum);
@@ -915,7 +997,7 @@ ACTOR Future<Void> writeEntireFile_impl(Reference<BlobStoreEndpoint> bstore, std
 	std::string contentMD5 = base64::encoder::from_string(sumBytes);
 	contentMD5.resize(contentMD5.size() - 1);
 
-	Void _ = wait(writeEntireFileFromBuffer_impl(bstore, bucket, object, &packets, content.size(), contentMD5));
+	wait(writeEntireFileFromBuffer_impl(bstore, bucket, object, &packets, content.size(), contentMD5));
 	return Void();
 }
 
@@ -930,7 +1012,7 @@ Future<Void> BlobStoreEndpoint::writeEntireFileFromBuffer(std::string const &buc
 ACTOR Future<int> readObject_impl(Reference<BlobStoreEndpoint> bstore, std::string bucket, std::string object, void *data, int length, int64_t offset) {
 	if(length <= 0)
 		return 0;
-	Void _ = wait(bstore->requestRateRead->getAllowance(1));
+	wait(bstore->requestRateRead->getAllowance(1));
 
 	std::string resource = std::string("/") + bucket + "/" + object;
 	HTTP::Headers headers;
@@ -950,7 +1032,7 @@ Future<int> BlobStoreEndpoint::readObject(std::string const &bucket, std::string
 }
 
 ACTOR static Future<std::string> beginMultiPartUpload_impl(Reference<BlobStoreEndpoint> bstore, std::string bucket, std::string object) {
-	Void _ = wait(bstore->requestRateWrite->getAllowance(1));
+	wait(bstore->requestRateWrite->getAllowance(1));
 
 	std::string resource = std::string("/") + bucket + "/" + object + "?uploads";
 	HTTP::Headers headers;
@@ -981,8 +1063,8 @@ Future<std::string> BlobStoreEndpoint::beginMultiPartUpload(std::string const &b
 }
 
 ACTOR Future<std::string> uploadPart_impl(Reference<BlobStoreEndpoint> bstore, std::string bucket, std::string object, std::string uploadID, unsigned int partNumber, UnsentPacketQueue *pContent, int contentLen, std::string contentMD5) {
-	Void _ = wait(bstore->requestRateWrite->getAllowance(1));
-	Void _ = wait(bstore->concurrentUploads.take());
+	wait(bstore->requestRateWrite->getAllowance(1));
+	wait(bstore->concurrentUploads.take());
 	state FlowLock::Releaser uploadReleaser(bstore->concurrentUploads, 1);
 
 	std::string resource = format("/%s/%s?partNumber=%d&uploadId=%s", bucket.c_str(), object.c_str(), partNumber, uploadID.c_str());
@@ -1010,8 +1092,8 @@ Future<std::string> BlobStoreEndpoint::uploadPart(std::string const &bucket, std
 }
 
 ACTOR Future<Void> finishMultiPartUpload_impl(Reference<BlobStoreEndpoint> bstore, std::string bucket, std::string object, std::string uploadID, BlobStoreEndpoint::MultiPartSetT parts) {
-	state UnsentPacketQueue part_list();  // NonCopyable state var so must be declared at top of actor
-	Void _ = wait(bstore->requestRateWrite->getAllowance(1));
+	state UnsentPacketQueue part_list;  // NonCopyable state var so must be declared at top of actor
+	wait(bstore->requestRateWrite->getAllowance(1));
 
 	std::string manifest = "<CompleteMultipartUpload>";
 	for(auto &p : parts)

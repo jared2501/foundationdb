@@ -26,8 +26,8 @@
 #include <stdint.h>
 #include <string>
 #include <map>
-#include "IRandom.h"
-#include "Error.h"
+#include "flow/IRandom.h"
+#include "flow/Error.h"
 
 #define TRACE_DEFAULT_ROLL_SIZE (10 << 20)
 #define TRACE_DEFAULT_MAX_LOGS_SIZE (10 * TRACE_DEFAULT_ROLL_SIZE)
@@ -40,6 +40,8 @@ inline int fastrand() {
 
 //inline static bool TRACE_SAMPLE() { return fastrand()<16; }
 inline static bool TRACE_SAMPLE() { return false; }
+
+extern int g_trace_depth;
 
 enum Severity {
 	SevSample=1,
@@ -71,6 +73,9 @@ public:
 	const Field &operator[] (int index) const;
 	bool tryGetValue(std::string key, std::string &outValue) const;
 	std::string getValue(std::string key) const;
+	int getInt(std::string key, bool permissive=false) const;
+	int64_t getInt64(std::string key, bool permissive=false) const;
+	double getDouble(std::string key, bool permissive=false) const;
 
 	std::string toString() const;
 	void validateFormat() const;
@@ -155,6 +160,7 @@ struct TraceEvent {
 	TraceEvent& detail( std::string key, int value );
 	TraceEvent& detail( std::string key, unsigned value );
 	TraceEvent& detail( std::string key, const struct NetworkAddress& value );
+	TraceEvent& detail( std::string key, const IPAddress& value );
 	TraceEvent& detailf( std::string key, const char* valueFormat, ... );
 	TraceEvent& detailext( std::string key, const StringRef& value );
 	TraceEvent& detailext( std::string key, const Optional<Standalone<StringRef>>& value );
@@ -261,6 +267,12 @@ void openTraceFile(const NetworkAddress& na, uint64_t rollsize, uint64_t maxLogs
 void initTraceEventMetrics();
 void closeTraceFile();
 bool traceFileIsOpen();
+
+// Changes the format of trace files. Returns false if the format is unrecognized. No longer safe to call after a call
+// to openTraceFile.
+bool selectTraceFormatter(std::string format);
+// Returns true iff format is recognized.
+bool validateTraceFormat(std::string format);
 
 void addTraceRole(std::string role);
 void removeTraceRole(std::string role);

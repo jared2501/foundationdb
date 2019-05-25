@@ -18,14 +18,14 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
 #include "flow/ActorCollection.h"
-#include "fdbclient/NativeAPI.h"
-#include "fdbserver/TesterInterface.h"
-#include "workloads.h"
-#include "fdbserver/WorkerInterface.h"
+#include "fdbclient/NativeAPI.actor.h"
+#include "fdbserver/TesterInterface.actor.h"
+#include "fdbserver/workloads/workloads.actor.h"
+#include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/QuietDatabase.h"
 #include "fdbserver/ServerDBInfo.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
 
 struct WorkerErrorsWorkload : TestWorkload {
@@ -42,13 +42,13 @@ struct WorkerErrorsWorkload : TestWorkload {
 	virtual void getMetrics( vector<PerfMetric>& m ) {}
 
 
-	ACTOR Future< std::vector< TraceEventFields > > latestEventOnWorkers( std::vector<std::pair<WorkerInterface, ProcessClass>> workers ) {
+	ACTOR Future< std::vector< TraceEventFields > > latestEventOnWorkers( std::vector<WorkerDetails> workers ) {
 		state vector<Future<TraceEventFields>> eventTraces;
 		for(int c = 0; c < workers.size(); c++) {
-			eventTraces.push_back( workers[c].first.eventLogRequest.getReply( EventLogRequest() ) );
+			eventTraces.push_back( workers[c].interf.eventLogRequest.getReply( EventLogRequest() ) );
 		}
 
-		Void _ = wait( timeoutError( waitForAll( eventTraces ), 2.0 ) );
+		wait( timeoutError( waitForAll( eventTraces ), 2.0 ) );
 
 		vector<TraceEventFields> results;
 		for(int i = 0; i < eventTraces.size(); i++) {
@@ -59,7 +59,7 @@ struct WorkerErrorsWorkload : TestWorkload {
 	}
 
 	ACTOR Future<Void> _start(Database cx, WorkerErrorsWorkload *self) {
-		state vector<std::pair<WorkerInterface, ProcessClass>> workers = wait( getWorkers( self->dbInfo ) );
+		state vector<WorkerDetails> workers = wait( getWorkers( self->dbInfo ) );
 		std::vector<TraceEventFields> errors = wait( self->latestEventOnWorkers( workers ) );
 		for(auto e : errors) {
 			printf("%s\n", e.toString().c_str());

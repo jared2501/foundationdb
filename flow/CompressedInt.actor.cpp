@@ -18,8 +18,8 @@
  * limitations under the License.
  */
 
-#include "UnitTest.h"
-#include "CompressedInt.h"
+#include "flow/UnitTest.h"
+#include "flow/CompressedInt.h"
 
 void printBitsLittle(size_t const size, void const * const ptr)
 {
@@ -63,15 +63,15 @@ void testCompressedInt(IntType n, StringRef rep = StringRef()) {
 	CompressedInt<IntType> cn(n);
 
 	w << cn;
-	if(rep.size() != 0 && w.toStringRef() != rep) {
+	if(rep.size() != 0 && w.toValue() != rep) {
 		printf("WRONG ENCODING:\n");
 		printf("  test value (BigE):  "); printBitsLittle(sizeof(IntType), &n);
-		printf("  encoded:            "); printBitsBig(w.toStringRef().size(), w.toStringRef().begin());
+		printf("  encoded:            "); printBitsBig(w.toValue().size(), w.toValue().begin());
 		printf("    expected:         "); printBitsBig(rep.size(), rep.begin());
 		puts("");
 	}
 	else
-		rep = w.toStringRef();
+		rep = w.toValue();
 
 	cn.value = 0;
 	BinaryReader r(rep, AssumeVersion(currentProtocolVersion));
@@ -86,7 +86,7 @@ void testCompressedInt(IntType n, StringRef rep = StringRef()) {
 	}
 }
 
-TEST_CASE("flow/compressed_ints") {
+TEST_CASE("/flow/compressed_ints") {
 	testCompressedInt<int>(-2, LiteralStringRef("\x7e"));
 	testCompressedInt<int>(-1, LiteralStringRef("\x7f"));
 	testCompressedInt<int>(0, LiteralStringRef("\x80"));

@@ -18,20 +18,20 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
-#include "ManagementAPI.h"
+#include "fdbclient/ManagementAPI.actor.h"
 
-#include "SystemData.h"
-#include "NativeAPI.h"
-#include "CoordinationInterface.h"
-#include "DatabaseContext.h"
+#include "fdbclient/SystemData.h"
+#include "fdbclient/NativeAPI.actor.h"
+#include "fdbclient/CoordinationInterface.h"
+#include "fdbclient/DatabaseContext.h"
 #include "fdbrpc/simulator.h"
-#include "StatusClient.h"
+#include "fdbclient/StatusClient.h"
 #include "flow/UnitTest.h"
 #include "fdbrpc/ReplicationPolicy.h"
 #include "fdbrpc/Replication.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
-static Future<vector<AddressExclusion>> getExcludedServers( Transaction* const& tr );
+ACTOR static Future<vector<AddressExclusion>> getExcludedServers(Transaction* tr);
 
 bool isInteger(const std::string& s) {
 	if( s.empty() ) return false;
@@ -81,58 +81,76 @@ std::map<std::string, std::string> configForToken( std::string const& mode ) {
 		return out;
 	}
 
+	Optional<KeyValueStoreType> logType;
 	Optional<KeyValueStoreType> storeType;
 	if (mode == "ssd-1") {
-		storeType= KeyValueStoreType::SSD_BTREE_V1;
+		logType = KeyValueStoreType::SSD_BTREE_V1;
+		storeType = KeyValueStoreType::SSD_BTREE_V1;
 	} else if (mode == "ssd" || mode == "ssd-2") {
+		logType = KeyValueStoreType::SSD_BTREE_V2;
 		storeType = KeyValueStoreType::SSD_BTREE_V2;
-	} else if (mode == "memory") {
+	} else if (mode == "ssd-redwood-experimental") {
+		logType = KeyValueStoreType::SSD_BTREE_V2;
+		storeType = KeyValueStoreType::SSD_REDWOOD_V1;
+	} else if (mode == "memory" || mode == "memory-2") {
+		logType = KeyValueStoreType::SSD_BTREE_V2;
+		storeType= KeyValueStoreType::MEMORY;
+	} else if (mode == "memory-1") {
+		logType = KeyValueStoreType::MEMORY;
 		storeType= KeyValueStoreType::MEMORY;
 	}
 	// Add any new store types to fdbserver/workloads/ConfigureDatabase, too
 
 	if (storeType.present()) {
-		out[p+"log_engine"] = out[p+"storage_engine"] = format("%d", storeType.get());
+		out[p+"log_engine"] = format("%d", logType.get());
+		out[p+"storage_engine"] = format("%d", storeType.get());
 		return out;
 	}
 
 	std::string redundancy, log_replicas;
-	IRepPolicyRef storagePolicy;
-	IRepPolicyRef tLogPolicy;
-	
+	Reference<IReplicationPolicy> storagePolicy;
+	Reference<IReplicationPolicy> tLogPolicy;
+
 	bool redundancySpecified = true;
 	if (mode == "single") {
 		redundancy="1";
 		log_replicas="1";
-		storagePolicy = tLogPolicy = IRepPolicyRef(new PolicyOne());
+		storagePolicy = tLogPolicy = Reference<IReplicationPolicy>(new PolicyOne());
 
 	} else if(mode == "double" || mode == "fast_recovery_double") {
 		redundancy="2";
 		log_replicas="2";
-		storagePolicy = tLogPolicy = IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())));
+		storagePolicy = tLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
 	} else if(mode == "triple" || mode == "fast_recovery_triple") {
 		redundancy="3";
 		log_replicas="3";
-		storagePolicy = tLogPolicy = IRepPolicyRef(new PolicyAcross(3, "zoneid", IRepPolicyRef(new PolicyOne())));
+		storagePolicy = tLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(3, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
 	} else if(mode == "three_datacenter" || mode == "multi_dc") {
 		redundancy="6";
 		log_replicas="4";
-		storagePolicy = IRepPolicyRef(new PolicyAcross(3, "dcid",
-			IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())))
+		storagePolicy = Reference<IReplicationPolicy>(new PolicyAcross(3, "dcid",
+			Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))
 		));
-		tLogPolicy = IRepPolicyRef(new PolicyAcross(2, "dcid",
-			IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())))
+		tLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "dcid",
+			Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))
 		));
 	} else if(mode == "three_datacenter_fallback") {
 		redundancy="4";
 		log_replicas="4";
-		storagePolicy = tLogPolicy = IRepPolicyRef(new PolicyAcross(2, "dcid", IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())))));
+		storagePolicy = tLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "dcid", Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))));
 	} else if(mode == "three_data_hall") {
 		redundancy="3";
 		log_replicas="4";
-		storagePolicy = IRepPolicyRef(new PolicyAcross(3, "data_hall", IRepPolicyRef(new PolicyOne())));
-		tLogPolicy = IRepPolicyRef(new PolicyAcross(2, "data_hall",
-			IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())))
+		storagePolicy = Reference<IReplicationPolicy>(new PolicyAcross(3, "data_hall", Reference<IReplicationPolicy>(new PolicyOne())));
+		tLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "data_hall",
+			Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))
+		));
+	} else if(mode == "three_data_hall_fallback") {
+		redundancy="2";
+		log_replicas="4";
+		storagePolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "data_hall", Reference<IReplicationPolicy>(new PolicyOne())));
+		tLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "data_hall",
+			Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))
 		));
 	} else
 		redundancySpecified = false;
@@ -143,38 +161,38 @@ std::map<std::string, std::string> configForToken( std::string const& mode ) {
 
 		BinaryWriter policyWriter(IncludeVersion());
 		serializeReplicationPolicy(policyWriter, storagePolicy);
-		out[p+"storage_replication_policy"] = policyWriter.toStringRef().toString();
+		out[p+"storage_replication_policy"] = policyWriter.toValue().toString();
 
 		policyWriter = BinaryWriter(IncludeVersion());
 		serializeReplicationPolicy(policyWriter, tLogPolicy);
-		out[p+"log_replication_policy"] = policyWriter.toStringRef().toString();
+		out[p+"log_replication_policy"] = policyWriter.toValue().toString();
 		return out;
 	}
 
 	std::string remote_redundancy, remote_log_replicas;
-	IRepPolicyRef remoteTLogPolicy;
+	Reference<IReplicationPolicy> remoteTLogPolicy;
 	bool remoteRedundancySpecified = true;
 	if (mode == "remote_default") {
 		remote_redundancy="0";
 		remote_log_replicas="0";
-		remoteTLogPolicy = IRepPolicyRef();
+		remoteTLogPolicy = Reference<IReplicationPolicy>();
 	} else if (mode == "remote_single") {
 		remote_redundancy="1";
 		remote_log_replicas="1";
-		remoteTLogPolicy = IRepPolicyRef(new PolicyOne());
+		remoteTLogPolicy = Reference<IReplicationPolicy>(new PolicyOne());
 	} else if(mode == "remote_double") {
 		remote_redundancy="2";
 		remote_log_replicas="2";
-		remoteTLogPolicy = IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())));
+		remoteTLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
 	} else if(mode == "remote_triple") {
 		remote_redundancy="3";
 		remote_log_replicas="3";
-		remoteTLogPolicy = IRepPolicyRef(new PolicyAcross(3, "zoneid", IRepPolicyRef(new PolicyOne())));
+		remoteTLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(3, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
 	} else if(mode == "remote_three_data_hall") { //FIXME: not tested in simulation
 		remote_redundancy="3";
 		remote_log_replicas="4";
-		remoteTLogPolicy = IRepPolicyRef(new PolicyAcross(2, "data_hall",
-			IRepPolicyRef(new PolicyAcross(2, "zoneid", IRepPolicyRef(new PolicyOne())))
+		remoteTLogPolicy = Reference<IReplicationPolicy>(new PolicyAcross(2, "data_hall",
+			Reference<IReplicationPolicy>(new PolicyAcross(2, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())))
 		));
 	} else
 		remoteRedundancySpecified = false;
@@ -183,7 +201,7 @@ std::map<std::string, std::string> configForToken( std::string const& mode ) {
 
 		BinaryWriter policyWriter(IncludeVersion());
 		serializeReplicationPolicy(policyWriter, remoteTLogPolicy);
-		out[p+"remote_log_policy"] = policyWriter.toStringRef().toString();
+		out[p+"remote_log_policy"] = policyWriter.toValue().toString();
 		return out;
 	}
 
@@ -210,18 +228,18 @@ ConfigurationResult::Type buildConfiguration( std::vector<StringRef> const& mode
 	auto p = configKeysPrefix.toString();
 	if(!outConf.count(p + "storage_replication_policy") && outConf.count(p + "storage_replicas")) {
 		int storageCount = stoi(outConf[p + "storage_replicas"]);
-		IRepPolicyRef storagePolicy = IRepPolicyRef(new PolicyAcross(storageCount, "zoneid", IRepPolicyRef(new PolicyOne())));
+		Reference<IReplicationPolicy> storagePolicy = Reference<IReplicationPolicy>(new PolicyAcross(storageCount, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
 		BinaryWriter policyWriter(IncludeVersion());
 		serializeReplicationPolicy(policyWriter, storagePolicy);
-		outConf[p+"storage_replication_policy"] = policyWriter.toStringRef().toString();
+		outConf[p+"storage_replication_policy"] = policyWriter.toValue().toString();
 	}
 
 	if(!outConf.count(p + "log_replication_policy") && outConf.count(p + "log_replicas")) {
 		int logCount = stoi(outConf[p + "log_replicas"]);
-		IRepPolicyRef logPolicy = IRepPolicyRef(new PolicyAcross(logCount, "zoneid", IRepPolicyRef(new PolicyOne())));
+		Reference<IReplicationPolicy> logPolicy = Reference<IReplicationPolicy>(new PolicyAcross(logCount, "zoneid", Reference<IReplicationPolicy>(new PolicyOne())));
 		BinaryWriter policyWriter(IncludeVersion());
 		serializeReplicationPolicy(policyWriter, logPolicy);
-		outConf[p+"log_replication_policy"] = policyWriter.toStringRef().toString();
+		outConf[p+"log_replication_policy"] = policyWriter.toValue().toString();
 	}
 	return ConfigurationResult::SUCCESS;
 }
@@ -255,14 +273,13 @@ ACTOR Future<DatabaseConfiguration> getDatabaseConfiguration( Database cx ) {
 	loop {
 		try {
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
-			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 			Standalone<RangeResultRef> res = wait( tr.getRange(configKeys, CLIENT_KNOBS->TOO_MANY) );
 			ASSERT( res.size() < CLIENT_KNOBS->TOO_MANY );
 			DatabaseConfiguration config;
 			config.fromKeyValues((VectorRef<KeyValueRef>) res);
 			return config;
 		} catch( Error &e ) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -285,15 +302,19 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 		}
 	}
 
-	state Future<Void> tooLong = delay(4.5);
+	state Future<Void> tooLong = delay(60);
+	state Key versionKey = BinaryWriter::toValue(g_random->randomUniqueID(),Unversioned());
+	state bool oldReplicationUsesDcId = false;
 	loop {
 		try {
 			tr.setOption( FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE );
 			tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+			tr.setOption( FDBTransactionOptions::USE_PROVISIONAL_PROXIES );
 
 			if(!creating && !force) {
 				state Future<Standalone<RangeResultRef>> fConfig = tr.getRange(configKeys, CLIENT_KNOBS->TOO_MANY);
-				Void _ = wait( success(fConfig) || tooLong );
+				state Future<vector<ProcessData>> fWorkers = getWorkers(&tr);
+				wait( success(fConfig) || tooLong );
 
 				if(!fConfig.isReady()) {
 					return ConfigurationResult::DATABASE_UNAVAILABLE;
@@ -310,6 +331,12 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 					if(!newConfig.isValid()) {
 						return ConfigurationResult::INVALID_CONFIGURATION;
 					}
+					
+					if(newConfig.tLogPolicy->attributeKeys().count("dcid") && newConfig.regions.size()>0) {
+						return ConfigurationResult::REGION_REPLICATION_MISMATCH;
+					}
+
+					oldReplicationUsesDcId = oldReplicationUsesDcId || oldConfig.tLogPolicy->attributeKeys().count("dcid");
 
 					if(oldConfig.usableRegions != newConfig.usableRegions) {
 						//cannot change region configuration
@@ -338,28 +365,52 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 					state Future<Standalone<RangeResultRef>> fServerList = (newConfig.regions.size()) ? tr.getRange( serverListKeys, CLIENT_KNOBS->TOO_MANY ) : Future<Standalone<RangeResultRef>>();
 
 					if(newConfig.usableRegions==2) {
-						//all regions with priority >= 0 must be fully replicated
-						state std::vector<Future<Optional<Value>>> replicasFutures;
-						for(auto& it : newConfig.regions) {
-							if(it.priority >= 0) {
-								replicasFutures.push_back(tr.get(datacenterReplicasKeyFor(it.dcId)));
-							}
-						}
-						Void _ = wait( waitForAll(replicasFutures) || tooLong );
+						if(oldReplicationUsesDcId) {
+								state Future<Standalone<RangeResultRef>> fLocalityList = tr.getRange( tagLocalityListKeys, CLIENT_KNOBS->TOO_MANY );
+								wait( success(fLocalityList) || tooLong );
+								if(!fLocalityList.isReady()) {
+									return ConfigurationResult::DATABASE_UNAVAILABLE;
+								}
+								Standalone<RangeResultRef> localityList = fLocalityList.get();
+								ASSERT( !localityList.more && localityList.size() < CLIENT_KNOBS->TOO_MANY );
 
-						for(auto& it : replicasFutures) {
-							if(!it.isReady()) {
-								return ConfigurationResult::DATABASE_UNAVAILABLE;
+								std::set<Key> localityDcIds;
+								for(auto& s : localityList) {
+									auto dc = decodeTagLocalityListKey( s.key );
+									if(dc.present()) {
+										localityDcIds.insert(dc.get());
+									}
+								}
+
+								for(auto& it : newConfig.regions) {
+									if(localityDcIds.count(it.dcId) == 0) {
+										return ConfigurationResult::DCID_MISSING;
+									}
+								}
+						} else {
+							//all regions with priority >= 0 must be fully replicated
+							state std::vector<Future<Optional<Value>>> replicasFutures;
+							for(auto& it : newConfig.regions) {
+								if(it.priority >= 0) {
+									replicasFutures.push_back(tr.get(datacenterReplicasKeyFor(it.dcId)));
+								}
 							}
-							if(!it.get().present()) {
-								return ConfigurationResult::REGION_NOT_FULLY_REPLICATED;
+							wait( waitForAll(replicasFutures) || tooLong );
+
+							for(auto& it : replicasFutures) {
+								if(!it.isReady()) {
+									return ConfigurationResult::DATABASE_UNAVAILABLE;
+								}
+								if(!it.get().present()) {
+									return ConfigurationResult::REGION_NOT_FULLY_REPLICATED;
+								}
 							}
 						}
 					}
 
 					if(newConfig.regions.size()) {
 						//all storage servers must be in one of the regions
-						Void _ = wait( success(fServerList) || tooLong );
+						wait( success(fServerList) || tooLong );
 						if(!fServerList.isReady()) {
 							return ConfigurationResult::DATABASE_UNAVAILABLE;
 						}
@@ -370,11 +421,53 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 						for(auto& it : newConfig.regions) {
 							newDcIds.insert(it.dcId);
 						}
+						std::set<Key> missingDcIds;
 						for(auto& s : serverList) {
 							auto ssi = decodeServerListValue( s.value );
 							if ( !ssi.locality.dcId().present() || !newDcIds.count(ssi.locality.dcId().get()) ) {
-								return ConfigurationResult::STORAGE_IN_UNKNOWN_DCID;
+								missingDcIds.insert(ssi.locality.dcId().get());
 							}
+						}
+						if(missingDcIds.size() > (oldReplicationUsesDcId ? 1 : 0)) {
+							return ConfigurationResult::STORAGE_IN_UNKNOWN_DCID;
+						}
+					}
+
+					wait( success(fWorkers) || tooLong );
+					if(!fWorkers.isReady()) {
+						return ConfigurationResult::DATABASE_UNAVAILABLE;
+					}
+
+					if(newConfig.regions.size()) {
+						std::map<Optional<Key>, std::set<Optional<Key>>> dcId_zoneIds;
+						for(auto& it : fWorkers.get()) {
+							if( it.processClass.machineClassFitness(ProcessClass::Storage) <= ProcessClass::WorstFit ) {
+								dcId_zoneIds[it.locality.dcId()].insert(it.locality.zoneId());
+							}
+						}
+						for(auto& region : newConfig.regions) {
+							if(dcId_zoneIds[region.dcId].size() < std::max(newConfig.storageTeamSize, newConfig.tLogReplicationFactor)) {
+								return ConfigurationResult::NOT_ENOUGH_WORKERS;
+							}
+							if(region.satelliteTLogReplicationFactor > 0 && region.priority >= 0) {
+								int totalSatelliteProcesses = 0;
+								for(auto& sat : region.satellites) {
+									totalSatelliteProcesses += dcId_zoneIds[sat.dcId].size();
+								}
+								if(totalSatelliteProcesses < region.satelliteTLogReplicationFactor) {
+									return ConfigurationResult::NOT_ENOUGH_WORKERS;
+								}
+							}
+						}
+					} else {
+						std::set<Optional<Key>> zoneIds;
+						for(auto& it : fWorkers.get()) {
+							if( it.processClass.machineClassFitness(ProcessClass::Storage) <= ProcessClass::WorstFit ) {
+								zoneIds.insert(it.locality.zoneId());
+							}
+						}
+						if(zoneIds.size() < std::max(newConfig.storageTeamSize, newConfig.tLogReplicationFactor)) {
+							return ConfigurationResult::NOT_ENOUGH_WORKERS;
 						}
 					}
 				}
@@ -392,7 +485,10 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 			for(auto i=m.begin(); i!=m.end(); ++i)
 				tr.set( StringRef(i->first), StringRef(i->second) );
 
-			Void _ = wait( tr.commit() );
+			tr.addReadConflictRange( singleKeyRange(moveKeysLockOwnerKey) );
+			tr.set( moveKeysLockOwnerKey, versionKey );
+
+			wait( tr.commit() );
 			break;
 		} catch (Error& e) {
 			state Error e1(e);
@@ -402,7 +498,8 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 				loop {
 					try {
 						tr.setOption( FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE );
-						tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+						tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+						tr.setOption( FDBTransactionOptions::USE_PROVISIONAL_PROXIES );
 
 						Optional<Value> v = wait( tr.get( initIdKey ) );
 						if (v != m[initIdKey.toString()])
@@ -410,11 +507,11 @@ ACTOR Future<ConfigurationResult::Type> changeConfig( Database cx, std::map<std:
 						else
 							return ConfigurationResult::DATABASE_CREATED;
 					} catch (Error& e2) {
-						Void _ = wait( tr.onError(e2) );
+						wait( tr.onError(e2) );
 					}
 				}
 			}
-			Void _ = wait( tr.onError(e1) );
+			wait( tr.onError(e1) );
 		}
 	}
 	return ConfigurationResult::SUCCESS;
@@ -454,6 +551,12 @@ ConfigureAutoResult parseConfig( StatusObject const& status ) {
 		log_replication = 4;
 	} else if( result.old_replication == "three_datacenter_fallback" ) {
 		storage_replication = 4;
+		log_replication = 4;
+	} else if( result.old_replication == "three_data_hall" ) {
+		storage_replication = 3;
+		log_replication = 4;
+	} else if( result.old_replication == "three_data_hall_fallback" ) {
+		storage_replication = 2;
 		log_replication = 4;
 	} else
 		return ConfigureAutoResult();
@@ -658,6 +761,7 @@ ConfigureAutoResult parseConfig( StatusObject const& status ) {
 
 ACTOR Future<ConfigurationResult::Type> autoConfig( Database cx, ConfigureAutoResult conf ) {
 	state Transaction tr(cx);
+	state Key versionKey = BinaryWriter::toValue(g_random->randomUniqueID(),Unversioned());
 
 	if(!conf.address_class.size())
 		return ConfigurationResult::INCOMPLETE_CONFIGURATION; //FIXME: correct return type
@@ -667,6 +771,7 @@ ACTOR Future<ConfigurationResult::Type> autoConfig( Database cx, ConfigureAutoRe
 			tr.setOption( FDBTransactionOptions::ACCESS_SYSTEM_KEYS );
 			tr.setOption( FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE );
 			tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+			tr.setOption( FDBTransactionOptions::USE_PROVISIONAL_PROXIES );
 
 			vector<ProcessData> workers = wait( getWorkers(&tr) );
 			std::map<NetworkAddress, Optional<Standalone<StringRef>>> address_processId;
@@ -707,10 +812,13 @@ ACTOR Future<ConfigurationResult::Type> autoConfig( Database cx, ConfigureAutoRe
 					tr.set(kv.first, kv.second);
 			}
 
-			Void _ = wait( tr.commit() );
+			tr.addReadConflictRange( singleKeyRange(moveKeysLockOwnerKey) );
+			tr.set( moveKeysLockOwnerKey, versionKey );
+
+			wait( tr.commit() );
 			return ConfigurationResult::SUCCESS;
 		} catch( Error &e ) {
-			Void _ = wait( tr.onError(e));
+			wait( tr.onError(e));
 		}
 	}
 }
@@ -740,7 +848,7 @@ ACTOR Future<vector<ProcessData>> getWorkers( Transaction* tr ) {
 	state Future<Standalone<RangeResultRef>> processClasses = tr->getRange( processClassKeys, CLIENT_KNOBS->TOO_MANY );
 	state Future<Standalone<RangeResultRef>> processData = tr->getRange( workerListKeys, CLIENT_KNOBS->TOO_MANY );
 
-	Void _ = wait( success(processClasses) && success(processData) );
+	wait( success(processClasses) && success(processData) );
 	ASSERT( !processClasses.get().more && processClasses.get().size() < CLIENT_KNOBS->TOO_MANY );
 	ASSERT( !processData.get().more && processData.get().size() < CLIENT_KNOBS->TOO_MANY );
 
@@ -775,7 +883,7 @@ ACTOR Future<vector<ProcessData>> getWorkers( Database cx ) {
 			vector<ProcessData> workers = wait( getWorkers(&tr) );
 			return workers;
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -791,7 +899,7 @@ ACTOR Future<std::vector<NetworkAddress>> getCoordinators( Database cx ) {
 
 			return ClusterConnectionString( currentKey.get().toString() ).coordinators();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -799,22 +907,35 @@ ACTOR Future<std::vector<NetworkAddress>> getCoordinators( Database cx ) {
 ACTOR Future<CoordinatorsResult::Type> changeQuorum( Database cx, Reference<IQuorumChange> change ) {
 	state Transaction tr(cx);
 	state int retries = 0;
+	state std::vector<NetworkAddress> desiredCoordinators;
+	state int notEnoughMachineResults = 0;
 
 	loop {
 		try {
 			tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+			tr.setOption( FDBTransactionOptions::USE_PROVISIONAL_PROXIES );
 			Optional<Value> currentKey = wait( tr.get( coordinatorsKey ) );
 
 			if (!currentKey.present())
 				return CoordinatorsResult::BAD_DATABASE_STATE;  // Someone deleted this key entirely?
 
 			state ClusterConnectionString old( currentKey.get().toString() );
-			if ( cx->cluster && old.clusterKeyName().toString() != cx->cluster->getConnectionFile()->getConnectionString().clusterKeyName() )
+			if ( cx->getConnectionFile() && old.clusterKeyName().toString() != cx->getConnectionFile()->getConnectionString().clusterKeyName() )
 				return CoordinatorsResult::BAD_DATABASE_STATE;  // Someone changed the "name" of the database??
 
 			state CoordinatorsResult::Type result = CoordinatorsResult::SUCCESS;
-			std::vector<NetworkAddress> _desiredCoordinators = wait( change->getDesiredCoordinators( &tr, old.coordinators(), Reference<ClusterConnectionFile>(new ClusterConnectionFile(old)), result ) );
-			std::vector<NetworkAddress> desiredCoordinators = _desiredCoordinators;
+			if(!desiredCoordinators.size()) {
+				std::vector<NetworkAddress> _desiredCoordinators = wait( change->getDesiredCoordinators( &tr, old.coordinators(), Reference<ClusterConnectionFile>(new ClusterConnectionFile(old)), result ) );
+				desiredCoordinators = _desiredCoordinators;
+			}
+
+			if(result == CoordinatorsResult::NOT_ENOUGH_MACHINES && notEnoughMachineResults < 1) {
+				//we could get not_enough_machines if we happen to see the database while the cluster controller is updating the worker list, so make sure it happens twice before returning a failure
+				notEnoughMachineResults++;
+				wait( delay(1.0) );
+				tr.reset();
+				continue;
+			}
 			if (result != CoordinatorsResult::SUCCESS)
 				return result;
 			if (!desiredCoordinators.size())
@@ -847,19 +968,19 @@ ACTOR Future<CoordinatorsResult::Type> changeQuorum( Database cx, Reference<IQuo
 				leaderServers.push_back( retryBrokenPromise( coord.clientLeaderServers[i].getLeader, GetLeaderRequest( coord.clusterKey, UID() ), TaskCoordinationReply ) );
 
 			choose {
-				when( Void _ = wait( waitForAll( leaderServers ) ) ) {}
-				when( Void _ = wait( delay(5.0) ) ) {
+				when( wait( waitForAll( leaderServers ) ) ) {}
+				when( wait( delay(5.0) ) ) {
 					return CoordinatorsResult::COORDINATOR_UNREACHABLE;
 				}
 			}
 
 			tr.set( coordinatorsKey, conn.toString() );
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			ASSERT( false ); //commit should fail, but the value has changed
 		} catch (Error& e) {
 			TraceEvent("RetryQuorumChange").error(e).detail("Retries", retries);
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 			++retries;
 		}
 	}
@@ -907,7 +1028,7 @@ struct AutoQuorumChange : IQuorumChange {
 	ACTOR static Future<int> getRedundancy( AutoQuorumChange* self, Transaction* tr ) {
 		state Future<Optional<Value>> fStorageReplicas = tr->get( LiteralStringRef("storage_replicas").withPrefix( configKeysPrefix ) );
 		state Future<Optional<Value>> fLogReplicas = tr->get( LiteralStringRef("log_replicas").withPrefix( configKeysPrefix ) );
-		Void _ = wait( success( fStorageReplicas ) && success( fLogReplicas ) );
+		wait( success( fStorageReplicas ) && success( fLogReplicas ) );
 		int redundancy = std::min(
 			atoi( fStorageReplicas.get().get().toString().c_str() ),
 			atoi( fLogReplicas.get().get().toString().c_str() ) );
@@ -969,15 +1090,13 @@ struct AutoQuorumChange : IQuorumChange {
 		//     check if multiple old coordinators map to the same locality data (same machine)
 		bool checkAcceptable = true;
 		std::set<Optional<Standalone<StringRef>>> checkDuplicates;
-		if (workers.size()){
-			for (auto addr : oldCoordinators) {
-				auto findResult = addr_locality.find(addr);
-				if (findResult == addr_locality.end() || checkDuplicates.count(findResult->second.zoneId())){
-					checkAcceptable = false;
-					break;
-				}
-				checkDuplicates.insert(findResult->second.zoneId());
+		for (auto addr : oldCoordinators) {
+			auto findResult = addr_locality.find(addr);
+			if (findResult == addr_locality.end() || checkDuplicates.count(findResult->second.zoneId())){
+				checkAcceptable = false;
+				break;
 			}
+			checkDuplicates.insert(findResult->second.zoneId());
 		}
 
 		if (checkAcceptable){
@@ -1005,6 +1124,8 @@ struct AutoQuorumChange : IQuorumChange {
 		vector<ProcessData> remainingWorkers(workers);
 		g_random->randomShuffle(remainingWorkers);
 
+		std::partition(remainingWorkers.begin(), remainingWorkers.end(), [](const ProcessData& data) { return (data.processClass == ProcessClass::CoordinatorClass); });
+
 		std::map<StringRef, int> maxCounts;
 		std::map<StringRef, std::map<StringRef, int>> currentCounts;
 		std::map<StringRef, int> hardLimits;
@@ -1017,7 +1138,7 @@ struct AutoQuorumChange : IQuorumChange {
 		});
 
 		for(auto field = fields.begin(); field != fields.end(); field++) {
-			if(field->toString() == "machineid") {
+			if(field->toString() == "zoneid") {
 				hardLimits[*field] = 1;
 			}
 			else {
@@ -1074,24 +1195,29 @@ Reference<IQuorumChange> autoQuorumChange( int desired ) { return Reference<IQuo
 
 ACTOR Future<Void> excludeServers( Database cx, vector<AddressExclusion> servers ) {
 	state Transaction tr(cx);
-	state std::string versionKey = g_random->randomUniqueID().toString();
+	state Key versionKey = BinaryWriter::toValue(g_random->randomUniqueID(),Unversioned());
+	state std::string excludeVersionKey = g_random->randomUniqueID().toString();
+
 	loop {
 		try {
 			tr.setOption( FDBTransactionOptions::ACCESS_SYSTEM_KEYS );
 			tr.setOption( FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE );
 			tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+			tr.setOption( FDBTransactionOptions::USE_PROVISIONAL_PROXIES );
 
 			tr.addReadConflictRange( singleKeyRange(excludedServersVersionKey) ); //To conflict with parallel includeServers
-			tr.set( excludedServersVersionKey, versionKey );
+			tr.addReadConflictRange( singleKeyRange(moveKeysLockOwnerKey) );
+			tr.set( moveKeysLockOwnerKey, versionKey );
+			tr.set( excludedServersVersionKey, excludeVersionKey );
 			for(auto& s : servers)
 				tr.set( encodeExcludedServersKey(s), StringRef() );
 
 			TraceEvent("ExcludeServersCommit").detail("Servers", describe(servers));
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return Void();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1099,25 +1225,40 @@ ACTOR Future<Void> excludeServers( Database cx, vector<AddressExclusion> servers
 ACTOR Future<Void> includeServers( Database cx, vector<AddressExclusion> servers ) {
 	state bool includeAll = false;
 	state Transaction tr(cx);
-	state std::string versionKey = g_random->randomUniqueID().toString();
+	state Key versionKey = BinaryWriter::toValue(g_random->randomUniqueID(),Unversioned());
+	state std::string excludeVersionKey = g_random->randomUniqueID().toString();
+
 	loop {
 		try {
 			tr.setOption( FDBTransactionOptions::ACCESS_SYSTEM_KEYS );
 			tr.setOption( FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE );
 			tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+			tr.setOption( FDBTransactionOptions::USE_PROVISIONAL_PROXIES );
 
 			// includeServers might be used in an emergency transaction, so make sure it is retry-self-conflicting and CAUSAL_WRITE_RISKY
 			tr.setOption( FDBTransactionOptions::CAUSAL_WRITE_RISKY );
 			tr.addReadConflictRange( singleKeyRange(excludedServersVersionKey) );
+			tr.addReadConflictRange( singleKeyRange(moveKeysLockOwnerKey) );
 
-			tr.set( excludedServersVersionKey, versionKey );
+			tr.set( moveKeysLockOwnerKey, versionKey );
+			tr.set( excludedServersVersionKey, excludeVersionKey );
+
 			for(auto& s : servers ) {
 				if (!s.isValid()) {
 					tr.clear( excludedServersKeys );
 					includeAll = true;
 				} else if (s.isWholeMachine()) {
-					// Eliminate both any ip-level exclusion (1.2.3.4) and any port-level exclusions (1.2.3.4:5)
-					tr.clear( KeyRangeRef( encodeExcludedServersKey(s), encodeExcludedServersKey(s) + char(':'+1) ) );
+					// Eliminate both any ip-level exclusion (1.2.3.4) and any
+					// port-level exclusions (1.2.3.4:5)
+					// The range ['IP', 'IP;'] was originally deleted. ';' is
+					// char(':' + 1). This does not work, as other for all
+					// x between 0 and 9, 'IPx' will also be in this range.
+					//
+					// This is why we now make two clears: first only of the ip
+					// address, the second will delete all ports.
+					auto addr = encodeExcludedServersKey(s);
+					tr.clear(singleKeyRange(addr));
+					tr.clear(KeyRangeRef(addr + ':', addr + char(':' + 1)));
 				} else {
 					tr.clear( encodeExcludedServersKey(s) );
 				}
@@ -1125,11 +1266,11 @@ ACTOR Future<Void> includeServers( Database cx, vector<AddressExclusion> servers
 
 			TraceEvent("IncludeServersCommit").detail("Servers", describe(servers));
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return Void();
 		} catch (Error& e) {
 			TraceEvent("IncludeServersError").error(e, true);
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1142,6 +1283,7 @@ ACTOR Future<Void> setClass( Database cx, AddressExclusion server, ProcessClass 
 			tr.setOption( FDBTransactionOptions::ACCESS_SYSTEM_KEYS );
 			tr.setOption( FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE );
 			tr.setOption( FDBTransactionOptions::LOCK_AWARE );
+			tr.setOption( FDBTransactionOptions::USE_PROVISIONAL_PROXIES );
 
 			vector<ProcessData> workers = wait( getWorkers(&tr) );
 
@@ -1159,10 +1301,10 @@ ACTOR Future<Void> setClass( Database cx, AddressExclusion server, ProcessClass 
 			if(foundChange)
 				tr.set(processClassChangeKey, g_random->randomUniqueID().toString());
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return Void();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1190,7 +1332,55 @@ ACTOR Future<vector<AddressExclusion>> getExcludedServers( Database cx ) {
 			vector<AddressExclusion> exclusions = wait( getExcludedServers(&tr) );
 			return exclusions;
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
+		}
+	}
+}
+
+ACTOR Future<Void> printHealthyZone( Database cx ) {
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			Optional<Value> val = wait( tr.get(healthyZoneKey) );
+			if(!val.present() || decodeHealthyZoneValue(val.get()).second <= tr.getReadVersion().get()) {
+				printf("No ongoing maintenance.\n");
+			} else {
+				auto healthyZone = decodeHealthyZoneValue(val.get());
+				printf("Maintenance for zone %s will continue for %d seconds.\n", healthyZone.first.toString().c_str(), (healthyZone.second-tr.getReadVersion().get())/CLIENT_KNOBS->CORE_VERSIONSPERSECOND);
+			}
+			return Void();
+		} catch( Error &e ) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+ACTOR Future<Void> clearHealthyZone( Database cx ) {
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.clear(healthyZoneKey);
+			wait(tr.commit());
+			return Void();
+		} catch( Error &e ) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+ACTOR Future<Void> setHealthyZone( Database cx, StringRef zoneId, double seconds ) {
+	state Transaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			Version readVersion = wait(tr.getReadVersion());
+			tr.set(healthyZoneKey, healthyZoneValue(zoneId, readVersion + (seconds*CLIENT_KNOBS->CORE_VERSIONSPERSECOND)));
+			wait(tr.commit());
+			return Void();
+		} catch( Error &e ) {
+			wait(tr.onError(e));
 		}
 	}
 }
@@ -1214,16 +1404,16 @@ ACTOR Future<int> setDDMode( Database cx, int mode ) {
 			if (!mode) {
 				BinaryWriter wrMyOwner(Unversioned());
 				wrMyOwner << dataDistributionModeLock;
-				tr.set( moveKeysLockOwnerKey, wrMyOwner.toStringRef() );
+				tr.set( moveKeysLockOwnerKey, wrMyOwner.toValue() );
 			}
 
-			tr.set( dataDistributionModeKey, wr.toStringRef() );
+			tr.set( dataDistributionModeKey, wr.toValue() );
 
-			Void _ = wait( tr.commit() );
+			wait( tr.commit() );
 			return oldMode;
 		} catch (Error& e) {
 			TraceEvent("SetDDModeRetrying").error(e);
-			Void _ = wait (tr.onError(e));
+			wait (tr.onError(e));
 		}
 	}
 }
@@ -1275,9 +1465,9 @@ ACTOR Future<Void> waitForExcludedServers( Database cx, vector<AddressExclusion>
 
 			if (ok) return Void();
 
-			Void _ = wait( delayJittered( 1.0 ) );  // SOMEDAY: watches!
+			wait( delayJittered( 1.0 ) );  // SOMEDAY: watches!
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1294,12 +1484,12 @@ ACTOR Future<Void> waitForFullReplication( Database cx ) {
 			ASSERT( !confResults.more && confResults.size() < CLIENT_KNOBS->TOO_MANY );
 			state DatabaseConfiguration config;
 			config.fromKeyValues((VectorRef<KeyValueRef>) confResults);
-			
+
 			state std::vector<Future<Optional<Value>>> replicasFutures;
 			for(auto& region : config.regions) {
 				replicasFutures.push_back(tr.get(datacenterReplicasKeyFor(region.dcId)));
 			}
-			Void _ = wait( waitForAll(replicasFutures) );
+			wait( waitForAll(replicasFutures) );
 
 			state std::vector<Future<Void>> watchFutures;
 			for(int i = 0; i < config.regions.size(); i++) {
@@ -1312,11 +1502,11 @@ ACTOR Future<Void> waitForFullReplication( Database cx ) {
 				return Void();
 			}
 
-			Void _ = wait( tr.commit() );
-			Void _ = wait( waitForAny(watchFutures) );
+			wait( tr.commit() );
+			wait( waitForAny(watchFutures) );
 			tr.reset();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1328,10 +1518,10 @@ ACTOR Future<Void> timeKeeperSetDisable(Database cx) {
 			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
 			tr.set(timeKeeperDisableKey, StringRef());
-			Void _ = wait(tr.commit());
+			wait(tr.commit());
 			return Void();
 		} catch (Error &e) {
-			Void _ = wait(tr.onError(e));
+			wait(tr.onError(e));
 		}
 	}
 }
@@ -1378,13 +1568,13 @@ ACTOR Future<Void> lockDatabase( Database cx, UID id ) {
 	state Transaction tr(cx);
 	loop {
 		try {
-			Void _ = wait( lockDatabase(&tr, id) );
-			Void _ = wait( tr.commit() );
+			wait( lockDatabase(&tr, id) );
+			wait( tr.commit() );
 			return Void();
 		} catch( Error &e ) {
 			if(e.code() == error_code_database_locked)
 				throw e;
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1427,13 +1617,13 @@ ACTOR Future<Void> unlockDatabase( Database cx, UID id ) {
 	state Transaction tr(cx);
 	loop {
 		try {
-			Void _ = wait( unlockDatabase(&tr, id) );
-			Void _ = wait( tr.commit() );
+			wait( unlockDatabase(&tr, id) );
+			wait( tr.commit() );
 			return Void();
 		} catch( Error &e ) {
 			if(e.code() == error_code_database_locked)
 				throw e;
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1464,16 +1654,18 @@ ACTOR Future<Void> checkDatabaseLock( Reference<ReadYourWritesTransaction> tr, U
 	return Void();
 }
 
-ACTOR Future<Void> forceRecovery (Reference<ClusterConnectionFile> clusterFile) {
+ACTOR Future<Void> forceRecovery( Reference<ClusterConnectionFile> clusterFile, Key dcId ) {
 	state Reference<AsyncVar<Optional<ClusterInterface>>> clusterInterface(new AsyncVar<Optional<ClusterInterface>>);
 	state Future<Void> leaderMon = monitorLeader<ClusterInterface>(clusterFile, clusterInterface);
 
-	while(!clusterInterface->get().present()) {
-		Void _ = wait(clusterInterface->onChange());
+	loop {
+		choose {
+			when ( wait( clusterInterface->get().present() ? brokenPromiseToNever( clusterInterface->get().get().forceRecovery.getReply( ForceRecoveryRequest(dcId) ) ) : Never() ) ) {
+				return Void();
+			}
+			when ( wait( clusterInterface->onChange() )) {}
+		}
 	}
-
-	ErrorOr<Void> _ = wait(clusterInterface->get().get().forceRecovery.tryGetReply( ForceRecoveryRequest() ));
-	return Void();
 }
 
 ACTOR Future<Void> waitForPrimaryDC( Database cx, StringRef dcId ) {
@@ -1488,11 +1680,11 @@ ACTOR Future<Void> waitForPrimaryDC( Database cx, StringRef dcId ) {
 			}
 
 			state Future<Void> watchFuture = tr.watch(primaryDatacenterKey);
-			Void _ = wait(tr.commit());
-			Void _ = wait(watchFuture);
+			wait(tr.commit());
+			wait(watchFuture);
 			tr.reset();
 		} catch (Error& e) {
-			Void _ = wait( tr.onError(e) );
+			wait( tr.onError(e) );
 		}
 	}
 }
@@ -1514,126 +1706,127 @@ void schemaCoverage( std::string const& spath, bool covered ) {
 	}
 }
 
-bool schemaMatch( StatusObject const schema, StatusObject const result, std::string& errorStr, Severity sev, bool checkCoverage, std::string path, std::string schema_path ) {
+bool schemaMatch( json_spirit::mValue const& schemaValue, json_spirit::mValue const& resultValue, std::string& errorStr, Severity sev, bool checkCoverage, std::string path, std::string schemaPath ) {
 	// Returns true if everything in `result` is permitted by `schema`
-
-	// Really this should recurse on "values" rather than "objects"?
-
 	bool ok = true;
 
 	try {
-		for(auto& rkv : result) {
-			auto& key = rkv.first;
-			auto& rv = rkv.second;
-			std::string kpath = path + "." + key;
-			std::string spath = schema_path + "." + key;
+		if(normJSONType(schemaValue.type()) != normJSONType(resultValue.type())) {
+			errorStr += format("ERROR: Incorrect value type for key `%s'\n", path.c_str());
+			TraceEvent(sev, "SchemaMismatch").detail("Path", path).detail("SchemaType", schemaValue.type()).detail("ValueType", resultValue.type());
+			return false;
+		}
 
-			if(checkCoverage) schemaCoverage(spath);
+		if(resultValue.type() == json_spirit::obj_type) {
+			auto& result = resultValue.get_obj();
+			auto& schema = schemaValue.get_obj();
 
-			if (!schema.count(key)) {
-				errorStr += format("ERROR: Unknown key `%s'\n", kpath.c_str());
-				TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaPath", spath);
-				ok = false;
-				continue;
-			}
-			auto& sv = schema.at(key);
+			for(auto& rkv : result) {
+				auto& key = rkv.first;
+				auto& rv = rkv.second;
+				std::string kpath = path + "." + key;
+				std::string spath = schemaPath + "." + key;
 
-			if (sv.type() == json_spirit::obj_type && sv.get_obj().count("$enum")) {
-				auto& enum_values = sv.get_obj().at("$enum").get_array();
+				if(checkCoverage) {
+					schemaCoverage(spath);
+				}
 
-				bool any_match = false;
-				for(auto& enum_item : enum_values)
-					if (enum_item == rv) {
-						any_match = true;
-						if(checkCoverage) schemaCoverage(spath + ".$enum." + enum_item.get_str());
-						break;
+				if(!schema.count(key)) {
+					errorStr += format("ERROR: Unknown key `%s'\n", kpath.c_str());
+					TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaPath", spath);
+					ok = false;
+					continue;
+				}
+				auto& sv = schema.at(key);
+
+				if(sv.type() == json_spirit::obj_type && sv.get_obj().count("$enum")) {
+					auto& enum_values = sv.get_obj().at("$enum").get_array();
+
+					bool any_match = false;
+					for(auto& enum_item : enum_values)
+						if(enum_item == rv) {
+							any_match = true;
+							if(checkCoverage) {
+								schemaCoverage(spath + ".$enum." + enum_item.get_str());
+							}
+							break;
+						}
+					if(!any_match) {
+						errorStr += format("ERROR: Unknown value `%s' for key `%s'\n", json_spirit::write_string(rv).c_str(), kpath.c_str());
+						TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaEnumItems", enum_values.size()).detail("Value", json_spirit::write_string(rv));
+						if(checkCoverage) {
+							schemaCoverage(spath + ".$enum." + json_spirit::write_string(rv));
+						}
+						ok = false;
 					}
-				if (!any_match) {
-					errorStr += format("ERROR: Unknown value `%s' for key `%s'\n", json_spirit::write_string(rv).c_str(), kpath.c_str());
-					TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaEnumItems", enum_values.size()).detail("Value", json_spirit::write_string(rv));
-					if(checkCoverage) schemaCoverage(spath + ".$enum." + json_spirit::write_string(rv));
-					ok = false;
-				}
-			} else if (sv.type() == json_spirit::obj_type && sv.get_obj().count("$map")) {
-				if (rv.type() != json_spirit::obj_type) {
-					errorStr += format("ERROR: Expected an object as the value for key `%s'\n", kpath.c_str());
-					TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaType", sv.type()).detail("ValueType", rv.type());
-					ok = false;
-					continue;
-				}
-				if(sv.get_obj().at("$map").type() != json_spirit::obj_type) {
-					continue;
-				}
-				auto& schema_obj = sv.get_obj().at("$map").get_obj();
-				auto& value_obj = rv.get_obj();
-
-				if(checkCoverage) schemaCoverage(spath + ".$map");
-
-				for(auto& value_pair : value_obj) {
-					auto vpath = kpath + "[" + value_pair.first + "]";
-					auto upath = spath + ".$map";
-					if (value_pair.second.type() != json_spirit::obj_type) {
-						errorStr += format("ERROR: Expected an object for `%s'\n", vpath.c_str());
-						TraceEvent(sev, "SchemaMismatch").detail("Path", vpath).detail("ValueType", value_pair.second.type());
+				} else if(sv.type() == json_spirit::obj_type && sv.get_obj().count("$map")) {
+					if(rv.type() != json_spirit::obj_type) {
+						errorStr += format("ERROR: Expected an object as the value for key `%s'\n", kpath.c_str());
+						TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaType", sv.type()).detail("ValueType", rv.type());
 						ok = false;
 						continue;
 					}
-					if (!schemaMatch(schema_obj, value_pair.second.get_obj(), errorStr, sev, checkCoverage, vpath, upath))
-						ok = false;
-				}
-			} else {
-				// The schema entry isn't an operator, so it asserts a type and (depending on the type) recursive schema definition
-				if (normJSONType(sv.type()) != normJSONType(rv.type())) {
-					errorStr += format("ERROR: Incorrect value type for key `%s'\n", kpath.c_str());
-					TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaType", sv.type()).detail("ValueType", rv.type());
-					ok = false;
-					continue;
-				}
-				if (rv.type() == json_spirit::array_type) {
-					auto& value_array = rv.get_array();
-					auto& schema_array = sv.get_array();
-					if (!schema_array.size()) {
-						// An empty schema array means that the value array is required to be empty
-						if (value_array.size()) {
-							errorStr += format("ERROR: Expected an empty array for key `%s'\n", kpath.c_str());
-							TraceEvent(sev, "SchemaMismatch").detail("Path", kpath).detail("SchemaSize", schema_array.size()).detail("ValueSize", value_array.size());
+					if(sv.get_obj().at("$map").type() != json_spirit::obj_type) {
+						continue;
+					}
+					auto& schemaVal = sv.get_obj().at("$map");
+					auto& valueObj = rv.get_obj();
+
+					if(checkCoverage) {
+						schemaCoverage(spath + ".$map");
+					}
+
+					for(auto& valuePair : valueObj) {
+						auto vpath = kpath + "[" + valuePair.first + "]";
+						auto upath = spath + ".$map";
+						if (valuePair.second.type() != json_spirit::obj_type) {
+							errorStr += format("ERROR: Expected an object for `%s'\n", vpath.c_str());
+							TraceEvent(sev, "SchemaMismatch").detail("Path", vpath).detail("ValueType", valuePair.second.type());
 							ok = false;
 							continue;
 						}
-					} else if (schema_array.size() == 1 && schema_array[0].type() == json_spirit::obj_type) {
-						// A one item schema array means that all items in the value must match the first item in the schema
-						auto& schema_obj = schema_array[0].get_obj();
-						int index = 0;
-						for(auto &value_item : value_array) {
-							if (value_item.type() != json_spirit::obj_type) {
-								errorStr += format("ERROR: Expected all array elements to be objects for key `%s'\n", kpath.c_str());
-								TraceEvent(sev, "SchemaMismatch").detail("Path", kpath + format("[%d]",index)).detail("ValueType", value_item.type());
-								ok = false;
-								continue;
-							}
-							if (!schemaMatch(schema_obj, value_item.get_obj(), errorStr, sev, checkCoverage, kpath + format("[%d]", index), spath + "[0]"))
-								ok = false;
-							index++;
+						if(!schemaMatch(schemaVal, valuePair.second, errorStr, sev, checkCoverage, vpath, upath)) {
+							ok = false;
 						}
-					} else
-						ASSERT(false);  // Schema doesn't make sense
-				} else if (rv.type() == json_spirit::obj_type) {
-					auto& schema_obj = sv.get_obj();
-					auto& value_obj = rv.get_obj();
-					if (!schemaMatch(schema_obj, value_obj, errorStr, sev, checkCoverage, kpath, spath))
+					}
+				} else {
+					if(!schemaMatch(sv, rv, errorStr, sev, checkCoverage, kpath, spath)) {
 						ok = false;
+					}
 				}
+			}
+		} else if(resultValue.type() == json_spirit::array_type) {
+			auto& valueArray = resultValue.get_array();
+			auto& schemaArray = schemaValue.get_array();
+			if(!schemaArray.size()) {
+				// An empty schema array means that the value array is required to be empty
+				if(valueArray.size()) {
+					errorStr += format("ERROR: Expected an empty array for key `%s'\n", path.c_str());
+					TraceEvent(sev, "SchemaMismatch").detail("Path", path).detail("SchemaSize", schemaArray.size()).detail("ValueSize", valueArray.size());
+					return false;
+				}
+			} else if(schemaArray.size() == 1) {
+				// A one item schema array means that all items in the value must match the first item in the schema
+				int index = 0;
+				for(auto &valueItem : valueArray) {
+					if(!schemaMatch(schemaArray[0], valueItem, errorStr, sev, checkCoverage, path + format("[%d]", index), schemaPath + "[0]")) {
+						ok = false;
+					}
+					index++;
+				}
+			} else {
+				ASSERT(false);  // Schema doesn't make sense
 			}
 		}
 		return ok;
 	} catch (std::exception& e) {
-		TraceEvent(SevError, "SchemaMatchException").detail("What", e.what()).detail("Path", path).detail("SchemaPath", schema_path);
+		TraceEvent(SevError, "SchemaMatchException").detail("What", e.what()).detail("Path", path).detail("SchemaPath", schemaPath);
 		throw unknown_error();
 	}
 }
 
-TEST_CASE("ManagementAPI/AutoQuorumChange/checkLocality") {
-	Void _ = wait(Future<Void>(Void()));
+TEST_CASE("/ManagementAPI/AutoQuorumChange/checkLocality") {
+	wait(Future<Void>(Void()));
 
 	std::vector<ProcessData> workers;
 	std::vector<NetworkAddress> chosen;
@@ -1651,10 +1844,13 @@ TEST_CASE("ManagementAPI/AutoQuorumChange/checkLocality") {
 		data.locality.set(LiteralStringRef("rack"), StringRef(rack));
 		data.locality.set(LiteralStringRef("zoneid"), StringRef(rack));
 		data.locality.set(LiteralStringRef("machineid"), StringRef(machineId));
-		data.address.ip = i;
+		data.address.ip = IPAddress(i);
 
 		workers.push_back(data);
 	}
+
+	auto noAssignIndex = g_random->randomInt(0, workers.size());
+	workers[noAssignIndex].processClass._class = ProcessClass::CoordinatorClass;
 
 	change.addDesiredWorkers(chosen, workers, 5, excluded);
 	std::map<StringRef, std::set<StringRef>> chosenValues;
@@ -1667,8 +1863,8 @@ TEST_CASE("ManagementAPI/AutoQuorumChange/checkLocality") {
 		LiteralStringRef("machineid")
 	});
 	for(auto worker = chosen.begin(); worker != chosen.end(); worker++) {
-		ASSERT(worker->ip < workers.size());
-		LocalityData data = workers[worker->ip].locality;
+		ASSERT(worker->ip.toV4() < workers.size());
+		LocalityData data = workers[worker->ip.toV4()].locality;
 		for(auto field = fields.begin(); field != fields.end(); field++) {
 			chosenValues[*field].insert(data.get(*field).get());
 		}
@@ -1678,6 +1874,7 @@ TEST_CASE("ManagementAPI/AutoQuorumChange/checkLocality") {
 	ASSERT(chosenValues[LiteralStringRef("data_hall")].size() == 4);
 	ASSERT(chosenValues[LiteralStringRef("zoneid")].size() == 5);
 	ASSERT(chosenValues[LiteralStringRef("machineid")].size() == 5);
+	ASSERT(std::find(chosen.begin(), chosen.end(), workers[noAssignIndex].address) != chosen.end());
 
 	return Void();
 }

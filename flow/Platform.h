@@ -53,8 +53,14 @@
 #error Compiling on unknown platform
 #endif
 
-#if defined(__linux__) && ((__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__) < 40500)
-#error GCC 4.5.0 or later required on this platform
+#if defined(__linux__)
+#  if defined(__clang__)
+#    if ((__clang_major__ * 100 + __clang_minor__) < 303)
+#      error Clang 3.3 or later is required on this platform
+#    endif
+#  elif ((__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__) < 40500)
+#    error GCC 4.5.0 or later required on this platform
+#  endif
 #endif
 
 #if defined(_WIN32) && (_MSC_VER < 1600)
@@ -239,7 +245,9 @@ struct SystemStatistics {
 
 struct SystemStatisticsState;
 
-SystemStatistics getSystemStatistics(std::string dataFolder, uint32_t ip, SystemStatisticsState **statState);
+struct IPAddress;
+
+SystemStatistics getSystemStatistics(std::string dataFolder, const IPAddress* ip, SystemStatisticsState **statState, bool logDetails);
 
 double getProcessorTimeThread();
 
@@ -264,7 +272,7 @@ void getNetworkTraffic(uint64_t& bytesSent, uint64_t& bytesReceived, uint64_t& o
 
 void getDiskStatistics(std::string const& directory, uint64_t& currentIOs, uint64_t& busyTicks, uint64_t& reads, uint64_t& writes, uint64_t& writeSectors);
 
-void getMachineLoad(uint64_t& idleTime, uint64_t& totalTime);
+void getMachineLoad(uint64_t& idleTime, uint64_t& totalTime, bool logDetails);
 
 double timer();  // Returns the system real time clock with high precision.  May jump around when system time is adjusted!
 double timer_monotonic();  // Returns a high precision monotonic clock which is adjusted to be kind of similar to timer() at startup, but might not be a globally accurate time.
@@ -284,6 +292,9 @@ void threadYield();  // Attempt to yield to other processes or threads
 
 // Returns true iff the file exists
 bool fileExists(std::string const& filename);
+
+// Returns true iff the directory exists
+bool directoryExists(std::string const& path);
 
 // Returns size of file in bytes
 int64_t fileSize(std::string const& filename);
@@ -309,14 +320,32 @@ void writeFile(std::string const& filename, std::string const& content);
 
 std::string joinPath( std::string const& directory, std::string const& filename );
 
-// Returns an absolute path canonicalized to use only CANONICAL_PATH_SEPARATOR
-std::string abspath( std::string const& filename );
+// cleanPath() does a 'logical' resolution of the given path string to a canonical form *without*
+// following symbolic links or verifying the existence of any path components.  It removes redundant
+// "." references and duplicate separators, and resolves any ".." references that can be resolved
+// using the preceding path components.
+// Relative paths remain relative and are NOT rebased on the current working directory.
+std::string cleanPath( std::string const& path );
+
+// abspath() resolves the given path to a canonical form.
+// If path is relative, the result will be based on the current working directory.
+// If resolveLinks is true then symbolic links will be expanded BEFORE resolving '..' references.
+// An empty path or a non-existent path when mustExist is true will result in a platform_error() exception.
+// Upon success, all '..' references will be resolved with the assumption that non-existent components
+// are NOT symbolic links.
+// User directory references such as '~' or '~user' are effectively treated as symbolic links which
+// are impossible to resolve, so resolveLinks=true results in failure and resolveLinks=false results
+// in the reference being left in-tact prior to resolving '..' references.
+std::string abspath( std::string const& path, bool resolveLinks = true, bool mustExist = false );
+
+// parentDirectory() returns the parent directory of the given file or directory in a canonical form,
+// with a single trailing path separator.
+// It uses absPath() with the same bool options to initially obtain a canonical form, and upon success
+// removes the final path component, if present.
+std::string parentDirectory( std::string const& path, bool resolveLinks = true, bool mustExist = false);
 
 // Returns the portion of the path following the last path separator (e.g. the filename or directory name)
 std::string basename( std::string const& filename );
-
-// Returns the parent directory of the given file or directory
-std::string parentDirectory( std::string const& filename );
 
 // Returns the home directory of the current user
 std::string getUserHomeDirectory();
@@ -521,12 +550,20 @@ bool isLibraryLoaded(const char* lib_path);
 void* loadLibrary(const char* lib_path);
 void* loadFunction(void* lib, const char* func_name);
 
-// MSVC not support noexcept yet
-#ifndef __GNUG__
-#ifndef VS14
-#define noexcept(enabled)
+#ifdef _WIN32
+inline static int ctzll( uint64_t value ) {
+    unsigned long count = 0;
+    if( _BitScanForward64( &count, value ) ) {
+        return count;
+    }
+    return 64;
+}
+#else
+#define ctzll __builtin_ctzll
 #endif
-#endif
+
+#include <boost/config.hpp>
+// The formerly existing BOOST_NOEXCEPT is now BOOST_NOEXCEPT
 
 #else
 #define EXTERNC

@@ -18,13 +18,13 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
 #include "fdbrpc/ContinuousSample.h"
-#include "fdbclient/NativeAPI.h"
-#include "fdbserver/TesterInterface.h"
-#include "BulkSetup.actor.h"
+#include "fdbclient/NativeAPI.actor.h"
+#include "fdbserver/TesterInterface.actor.h"
+#include "fdbserver/workloads/BulkSetup.actor.h"
 #include "fdbclient/ReadYourWrites.h"
-#include "workloads.h"
+#include "fdbserver/workloads/workloads.actor.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
 struct UnreadableWorkload : TestWorkload {
 	uint64_t nodeCount;
@@ -362,10 +362,11 @@ struct UnreadableWorkload : TestWorkload {
 						tr.setOption(FDBTransactionOptions::SNAPSHOT_RYW_ENABLE);
 					if (!value.isError() || value.getError().code() == error_code_accessed_unreadable) {
 						//TraceEvent("RYWT_GetRange").detail("Range", printable(range)).detail("IsUnreadable", value.isError());
-						if (snapshot)
+						if (snapshot) {
 							ASSERT(!value.isError());
-						else
+						} else {
 							ASSERT(containsUnreadable(unreadableMap, range, true).present() == value.isError());
+						}
 					}
 					else {
 						//TraceEvent("RYWT_Reset1").error(value.getError(), true);

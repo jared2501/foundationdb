@@ -18,13 +18,13 @@
  * limitations under the License.
  */
 
-#include "flow/actorcompiler.h"
 #include "fdbserver/CoordinationInterface.h"
-#include "IKeyValueStore.h"
+#include "fdbserver/IKeyValueStore.h"
 #include "flow/ActorCollection.h"
-#include "Knobs.h"
+#include "fdbserver/Knobs.h"
 #include "flow/UnitTest.h"
 #include "flow/IndexedSet.h"
+#include "flow/actorcompiler.h"  // This must be the last #include.
 
 // This module implements coordinationServer() and the interfaces in CoordinationInterface.h
 
@@ -33,7 +33,7 @@ struct GenerationRegVal {
 	Optional<Value> val;
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & readGen & writeGen & val;
+		serializer(ar, readGen, writeGen, val);
 	}
 };
 
@@ -45,8 +45,8 @@ UID WLTOKEN_GENERATIONREG_READ( -1, 6 );
 UID WLTOKEN_GENERATIONREG_WRITE( -1, 7 );
 
 GenerationRegInterface::GenerationRegInterface( NetworkAddress remote )
-	: read( Endpoint(remote, WLTOKEN_GENERATIONREG_READ) ),
-		write( Endpoint(remote, WLTOKEN_GENERATIONREG_WRITE) )
+	: read( Endpoint({remote}, WLTOKEN_GENERATIONREG_READ) ),
+	  write( Endpoint({remote}, WLTOKEN_GENERATIONREG_WRITE) )
 {
 }
 
@@ -58,9 +58,9 @@ GenerationRegInterface::GenerationRegInterface( INetwork* local )
 
 LeaderElectionRegInterface::LeaderElectionRegInterface(NetworkAddress remote)
 	: ClientLeaderRegInterface(remote),
-	  candidacy( Endpoint(remote, WLTOKEN_LEADERELECTIONREG_CANDIDACY) ),
-	  leaderHeartbeat( Endpoint(remote, WLTOKEN_LEADERELECTIONREG_LEADERHEARTBEAT) ),
-	  forward( Endpoint(remote, WLTOKEN_LEADERELECTIONREG_FORWARD) )
+	  candidacy( Endpoint({remote}, WLTOKEN_LEADERELECTIONREG_CANDIDACY) ),
+	  leaderHeartbeat( Endpoint({remote}, WLTOKEN_LEADERELECTIONREG_LEADERHEARTBEAT) ),
+	  forward( Endpoint({remote}, WLTOKEN_LEADERELECTIONREG_FORWARD) )
 {
 }
 
@@ -111,7 +111,7 @@ private:
 
 	ACTOR static Future<Void> onErr( Future<Future<Void>> e ) {
 		Future<Void> f = wait(e);
-		Void _ = wait(f);
+		wait(f);
 		return Void();
 	}
 
@@ -128,7 +128,7 @@ ACTOR Future<Void> localGenerationReg( GenerationRegInterface interf, OnDemandSt
 	// SOMEDAY: concurrent access to different keys?
 	loop choose {
 		when ( GenerationRegReadRequest _req = waitNext( interf.read.getFuture() ) ) {
-			TraceEvent("GenerationRegReadRequest").detail("From", _req.reply.getEndpoint().address).detail("K", printable(_req.key));
+			TraceEvent("GenerationRegReadRequest").detail("From", _req.reply.getEndpoint().getPrimaryAddress()).detail("K", printable(_req.key));
 			state GenerationRegReadRequest req = _req;
 			Optional<Value> rawV = wait( store->readValue( req.key ) );
 			v = rawV.present() ? BinaryReader::fromStringRef<GenerationRegVal>( rawV.get(), IncludeVersion() ) : GenerationRegVal();
@@ -136,7 +136,7 @@ ACTOR Future<Void> localGenerationReg( GenerationRegInterface interf, OnDemandSt
 			if (v.readGen < req.gen) {
 				v.readGen = req.gen;
 				store->set( KeyValueRef( req.key, BinaryWriter::toValue(v, IncludeVersion()) ) );
-				Void _ = wait(store->commit());
+				wait(store->commit());
 			}
 			req.reply.send( GenerationRegReadReply( v.val, v.writeGen, v.readGen ) );
 		}
@@ -148,12 +148,12 @@ ACTOR Future<Void> localGenerationReg( GenerationRegInterface interf, OnDemandSt
 				v.writeGen = wrq.gen;
 				v.val = wrq.kv.value;
 				store->set( KeyValueRef( wrq.kv.key, BinaryWriter::toValue(v, IncludeVersion()) ) );
-				Void _ = wait(store->commit());
-				TraceEvent("GenerationRegWrote").detail("From", wrq.reply.getEndpoint().address).detail("Key", printable(wrq.kv.key))
+				wait(store->commit());
+				TraceEvent("GenerationRegWrote").detail("From", wrq.reply.getEndpoint().getPrimaryAddress()).detail("Key", printable(wrq.kv.key))
 					.detail("ReqGen", wrq.gen.generation).detail("Returning", v.writeGen.generation);
 				wrq.reply.send( v.writeGen );
 			} else {
-				TraceEvent("GenerationRegWriteFail").detail("From", wrq.reply.getEndpoint().address).detail("Key", printable(wrq.kv.key))
+				TraceEvent("GenerationRegWriteFail").detail("From", wrq.reply.getEndpoint().getPrimaryAddress()).detail("Key", printable(wrq.kv.key))
 					.detail("ReqGen", wrq.gen.generation).detail("ReadGen", v.readGen.generation).detail("WriteGen", v.writeGen.generation);
 				wrq.reply.send( std::max( v.readGen, v.writeGen ) );
 			}
@@ -161,39 +161,45 @@ ACTOR Future<Void> localGenerationReg( GenerationRegInterface interf, OnDemandSt
 	}
 };
 
-TEST_CASE("fdbserver/Coordination/localGenerationReg/simple") {
+TEST_CASE("/fdbserver/Coordination/localGenerationReg/simple") {
 	state GenerationRegInterface reg;
 	state OnDemandStore store("simfdb/unittests/", //< FIXME
 		g_random->randomUniqueID());
 	state Future<Void> actor = localGenerationReg(reg, &store);
-	state Key the_key = g_random->randomAlphaNumeric( g_random->randomInt(0, 10) );
+	state Key the_key(g_random->randomAlphaNumeric( g_random->randomInt(0, 10)));
 
 	state UniqueGeneration firstGen(0, g_random->randomUniqueID());
 
-	GenerationRegReadReply r = wait(reg.read.getReply(GenerationRegReadRequest(the_key, firstGen)));
-	//   If there was no prior write(_,_,0) or a data loss fault, 
-	//     returns (Optional(),0,gen2)
-	ASSERT(!r.value.present());
-	ASSERT(r.gen == UniqueGeneration());
-	ASSERT(r.rgen == firstGen); 
+	{
+		GenerationRegReadReply r = wait(reg.read.getReply(GenerationRegReadRequest(the_key, firstGen)));
+		//   If there was no prior write(_,_,0) or a data loss fault, 
+		//     returns (Optional(),0,gen2)
+		ASSERT(!r.value.present());
+		ASSERT(r.gen == UniqueGeneration());
+		ASSERT(r.rgen == firstGen); 
+	}
 
-	UniqueGeneration g = wait(reg.write.getReply(GenerationRegWriteRequest(KeyValueRef(the_key, LiteralStringRef("Value1")), firstGen)));
-	//   (gen1==gen is considered a "successful" write)
-	ASSERT(g == firstGen);
+	{
+		UniqueGeneration g = wait(reg.write.getReply(GenerationRegWriteRequest(KeyValueRef(the_key, LiteralStringRef("Value1")), firstGen)));
+		//   (gen1==gen is considered a "successful" write)
+		ASSERT(g == firstGen);
+	}
 
-	GenerationRegReadReply r = wait(reg.read.getReply(GenerationRegReadRequest(the_key, UniqueGeneration())));
-	// read(key,gen2) returns (value,gen,rgen).
-	//     There was some earlier or concurrent write(key,value,gen).
-	ASSERT(r.value == LiteralStringRef("Value1"));
-	ASSERT(r.gen == firstGen);
-	//     There was some earlier or concurrent read(key,rgen).
-	ASSERT(r.rgen == firstGen);
-	//     If there is a write(key,_,gen1)=>gen1 s.t. gen1 < gen2 OR the write completed before this read started, then gen >= gen1.
-	ASSERT(r.gen >= firstGen);
-	//     If there is a read(key,gen1) that completed before this read started, then rgen >= gen1
-	ASSERT(r.rgen >= firstGen);
+	{
+		GenerationRegReadReply r = wait(reg.read.getReply(GenerationRegReadRequest(the_key, UniqueGeneration())));
+		// read(key,gen2) returns (value,gen,rgen).
+		//     There was some earlier or concurrent write(key,value,gen).
+		ASSERT(r.value == LiteralStringRef("Value1"));
+		ASSERT(r.gen == firstGen);
+		//     There was some earlier or concurrent read(key,rgen).
+		ASSERT(r.rgen == firstGen);
+		//     If there is a write(key,_,gen1)=>gen1 s.t. gen1 < gen2 OR the write completed before this read started, then gen >= gen1.
+		ASSERT(r.gen >= firstGen);
+		//     If there is a read(key,gen1) that completed before this read started, then rgen >= gen1
+		ASSERT(r.rgen >= firstGen);
 
-	ASSERT(!actor.isReady());
+		ASSERT(!actor.isReady());
+	}
 	return Void();
 }
 
@@ -250,13 +256,13 @@ ACTOR Future<Void> leaderRegister(LeaderElectionRegInterface interf, Key key) {
 			LeaderInfo newInfo;
 			newInfo.forward = true;
 			newInfo.serializedInfo = req.conn.toString();
-			for(int i=0; i<notify.size(); i++)
+			for(unsigned int i=0; i<notify.size(); i++)
 				notify[i].send( newInfo );
 			notify.clear();
 			req.reply.send( Void() );
 			return Void();
 		}
-		when ( Void _ = wait(nextInterval) ) {
+		when ( wait(nextInterval) ) {
 			if (!availableLeaders.size() && !availableCandidates.size() && !notify.size() &&
 				!currentNominee.present())
 			{
@@ -288,7 +294,7 @@ ACTOR Future<Void> leaderRegister(LeaderElectionRegInterface interf, Key key) {
 				if ( !nextNominee.present() || !foundCurrentNominee || currentNominee.get().leaderChangeRequired(nextNominee.get()) ) {
 					TraceEvent("NominatingLeader").detail("Nominee", nextNominee.present() ? nextNominee.get().changeID : UID())
 						.detail("Changed", nextNominee != currentNominee).detail("Key", printable(key));
-					for(int i=0; i<notify.size(); i++)
+					for(unsigned int i=0; i<notify.size(); i++)
 						notify[i].send( nextNominee );
 					notify.clear();
 					currentNominee = nextNominee;
@@ -312,7 +318,7 @@ ACTOR Future<Void> leaderRegister(LeaderElectionRegInterface interf, Key key) {
 				availableCandidates.clear();
 			}
 		}
-		when( Void _ = wait(notifyCheck) ) {
+		when( wait(notifyCheck) ) {
 			notifyCheck = delay( SERVER_KNOBS->NOTIFICATION_FULL_CLEAR_TIME / std::max<double>(SERVER_KNOBS->MIN_NOTIFICATIONS, notify.size()) );
 			if(!notify.empty() && currentNominee.present()) {
 				notify.front().send( currentNominee.get() );
@@ -366,7 +372,7 @@ struct LeaderRegisterCollection {
 		self->forward[ key ] = forwardInfo;
 		OnDemandStore &store = *self->pStore;
 		store->set( KeyValueRef( key.withPrefix( fwdKeys.begin ), conn.toString() ) );
-		Void _ = wait(store->commit());
+		wait(store->commit());
 		return Void();
 	}
 
@@ -387,7 +393,7 @@ struct LeaderRegisterCollection {
 	ACTOR static Future<Void> wrap( LeaderRegisterCollection* self, Key key, Future<Void> actor ) {
 		state Error e;
 		try { 
-			Void _ = wait(actor); 
+			wait(actor); 
 		} catch (Error& err) {
 			if (err.code() == error_code_actor_cancelled)
 				throw;
@@ -406,7 +412,7 @@ ACTOR Future<Void> leaderServer(LeaderElectionRegInterface interf, OnDemandStore
 	state LeaderRegisterCollection regs( pStore );
 	state ActorCollection forwarders(false);
 
-	Void _ = wait( LeaderRegisterCollection::init( &regs ) ); 
+	wait( LeaderRegisterCollection::init( &regs ) ); 
 
 	loop choose {
 		when ( GetLeaderRequest req = waitNext( interf.getLeader.getFuture() ) ) {
@@ -439,7 +445,7 @@ ACTOR Future<Void> leaderServer(LeaderElectionRegInterface interf, OnDemandStore
 				regs.getInterface(req.key).forward.send(req);
 			}
 		}
-		when( Void _ = wait( forwarders.getResult() ) ) { ASSERT(false); throw internal_error(); }
+		when( wait( forwarders.getResult() ) ) { ASSERT(false); throw internal_error(); }
 	}
 }
 
@@ -449,10 +455,10 @@ ACTOR Future<Void> coordinationServer(std::string dataFolder) {
 	state GenerationRegInterface myInterface( g_network );
 	state OnDemandStore store( dataFolder, myID );
 
-	TraceEvent("CoordinationServer", myID).detail("MyInterfaceAddr", myInterface.read.getEndpoint().address).detail("Folder", dataFolder);
+	TraceEvent("CoordinationServer", myID).detail("MyInterfaceAddr", myInterface.read.getEndpoint().getPrimaryAddress()).detail("Folder", dataFolder);
 
 	try {
-		Void _ = wait( localGenerationReg(myInterface, &store) || leaderServer(myLeaderInterface, &store) || store.getError() );
+		wait( localGenerationReg(myInterface, &store) || leaderServer(myLeaderInterface, &store) || store.getError() );
 		throw internal_error();
 	} catch (Error& e) {
 		TraceEvent("CoordinationServerError", myID).error(e, true);

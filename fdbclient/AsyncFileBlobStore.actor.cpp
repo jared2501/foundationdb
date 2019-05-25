@@ -21,6 +21,7 @@
 #include "fdbclient/AsyncFileBlobStore.actor.h"
 #include "fdbrpc/AsyncFileReadAhead.actor.h"
 #include "flow/UnitTest.h"
+#include "flow/actorcompiler.h" // has to be last include
 
 Future<int64_t> AsyncFileBlobStoreRead::size() {
 	if(!m_size.isValid())
@@ -39,7 +40,7 @@ ACTOR Future<Void> sendStuff(int id, Reference<IRateControl> t, int bytes) {
 	state int total = 0;
 	while(total < bytes) {
 		state int r = std::min<int>(g_random->randomInt(0,1000), bytes - total);
-		Void _ = wait(t->getAllowance(r));
+		wait(t->getAllowance(r));
 		total += r;
 	}
 	double dur = timer() - ts;
@@ -47,7 +48,7 @@ ACTOR Future<Void> sendStuff(int id, Reference<IRateControl> t, int bytes) {
 	return Void();
 }
 
-TEST_CASE("backup/throttling") {
+TEST_CASE("/backup/throttling") {
 	// Test will not work in simulation.
 	if(g_network->isSimulated())
 		return Void();
@@ -69,7 +70,7 @@ TEST_CASE("backup/throttling") {
 	s = 5000;
 	f.push_back(sendStuff(id++, t, s)); total += s;
 
-	Void _ = wait(waitForAll(f));
+	wait(waitForAll(f));
 	double dur = timer() - ts;
 	int speed = int(total / dur);
 	printf("Speed limit was %d, measured speed was %d\n", limit, speed);

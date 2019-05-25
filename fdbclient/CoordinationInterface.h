@@ -22,7 +22,7 @@
 #define FDBCLIENT_COORDINATIONINTERFACE_H
 #pragma once
 
-#include "FDBTypes.h"
+#include "fdbclient/FDBTypes.h"
 #include "fdbrpc/fdbrpc.h"
 #include "fdbrpc/Locality.h"
 
@@ -66,7 +66,6 @@ public:
 	//  - The description contains only allowed characters (a-z, A-Z, 0-9, _)
 	//  - The ID contains only allowed characters (a-z, A-Z, 0-9)
 	//  - At least one address is specified
-	//  - All addresses either have TLS enabled or disabled (no mixing)
 	//  - There is no address present more than once
 	explicit ClusterConnectionFile( std::string const& path );
 	explicit ClusterConnectionFile(ClusterConnectionString const& cs) : cs(cs), setConn(false) {}
@@ -77,11 +76,11 @@ public:
 	// get a human readable error message describing the error returned from the constructor
 	static std::string getErrorString( std::pair<std::string, bool> const& resolvedFile, Error const& e );
 
-	ClusterConnectionString const& getConnectionString();
+	ClusterConnectionString const& getConnectionString() const;
 	bool writeFile();
 	void setConnectionString( ClusterConnectionString const& );
 	std::string const& getFilename() const { ASSERT( filename.size() ); return filename; }
-	bool canGetFilename() { return filename.size() != 0; }
+	bool canGetFilename() const { return filename.size() != 0; }
 	bool fileContentsUpToDate() const;
 	bool fileContentsUpToDate(ClusterConnectionString &fileConnectionString) const;
 	void notifyConnected();
@@ -122,7 +121,7 @@ struct LeaderInfo {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & changeID & serializedInfo & forward;
+		serializer(ar, changeID, serializedInfo, forward);
 	}
 };
 
@@ -136,7 +135,7 @@ struct GetLeaderRequest {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & key & knownLeader & reply;
+		serializer(ar, key, knownLeader, reply);
 	}
 };
 

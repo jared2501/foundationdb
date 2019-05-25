@@ -24,11 +24,12 @@
 #pragma once
 
 #include "flow/flow.h"
-#include "FDBTypes.h"
+#include "fdbclient/FDBTypes.h"
 
 struct JSONSchemas {
 	static const KeyRef statusSchema;
-	static const KeyRef configurationSchema;
+	static const KeyRef clusterConfigurationSchema;
+	static const KeyRef latencyBandConfigurationSchema;
 };
 
 #endif /* FDBCLIENT_SCHEMAS_H */

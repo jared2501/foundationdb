@@ -24,9 +24,9 @@
 
 #include "flow/flow.h"
 #include "flow/IndexedSet.h"
-#include "FDBTypes.h"
+#include "fdbclient/FDBTypes.h"
 #include "flow/IRandom.h"
-#include "VersionedMap.actor.h"
+#include "fdbclient/VersionedMap.actor.h"
 
 // PTree is a persistent balanced binary tree implementation. It is based on a treap as a way to guarantee O(1) space for node insertion (rotating is asymptotically cheap), 
 // but the constant factors are very large.
@@ -489,10 +489,10 @@ public:
 	VersionedMap() : oldestVersion(0), latestVersion(0) {
 		latestRoot = &roots[0];
 	}
-	VersionedMap( VersionedMap&& v ) noexcept(true) : oldestVersion(v.oldestVersion), latestVersion(v.latestVersion), roots(std::move(v.roots)) {
+	VersionedMap( VersionedMap&& v ) BOOST_NOEXCEPT : oldestVersion(v.oldestVersion), latestVersion(v.latestVersion), roots(std::move(v.roots)) {
 		latestRoot = &roots[latestVersion];
 	}
-	void operator = (VersionedMap && v) noexcept(true) {
+	void operator = (VersionedMap && v) BOOST_NOEXCEPT {
 		oldestVersion = v.oldestVersion;
 		latestVersion = v.latestVersion;
 		roots = std::move(v.roots);

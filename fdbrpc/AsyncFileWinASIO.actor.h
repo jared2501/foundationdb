@@ -27,7 +27,7 @@
 // When actually compiled (NO_INTELLISENSE), include the generated version of this file.  In intellisense use the source version.
 #if defined(NO_INTELLISENSE) && !defined(FLOW_ASYNCFILEWINASIO_ACTOR_G_H)
 	#define FLOW_ASYNCFILEWINASIO_ACTOR_G_H
-	#include "AsyncFileWinASIO.actor.g.h"
+	#include "fdbrpc/AsyncFileWinASIO.actor.g.h"
 #elif !defined(FLOW_ASYNCFILEWINASIO_ACTOR_H)
 	#define FLOW_ASYNCFILEWINASIO_ACTOR_H
 
@@ -43,10 +43,7 @@ public:
 	// FIXME: This implementation isn't actually asynchronous - it just does operations synchronously!
 
 	static Future<Reference<IAsyncFile>> open( std::string filename, int flags, int mode, boost::asio::io_service* ios ) {
-		if (!(flags & OPEN_UNBUFFERED)) {
-			TraceEvent(SevError, "FileOpenError").detail("Reason", "Must be unbuffered").detail("Flags", flags).detail("File", filename);
-			return io_error();
-		}
+		ASSERT( flags & OPEN_UNBUFFERED );
 
 		std::string open_filename = filename;
 		if (flags & OPEN_ATOMIC_WRITE_AND_CREATE) {

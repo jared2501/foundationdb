@@ -22,7 +22,7 @@
 #define FLOW_KNOBS_H
 #pragma once
 
-#include "Platform.h"
+#include "flow/Platform.h"
 
 #include <map>
 #include <string>
@@ -61,6 +61,9 @@ public:
 	double QUEUE_MODEL_SMOOTHING_AMOUNT;
 
 	int RANDOMSEED_RETRY_LIMIT;
+	double FAST_ALLOC_LOGGING_BYTES;
+	double HUGE_ARENA_LOGGING_BYTES;
+	double HUGE_ARENA_LOGGING_INTERVAL;
 
 	//slow task profiling
 	double SLOWTASK_PROFILING_INTERVAL;
@@ -92,12 +95,15 @@ public:
 	int64_t BUGGIFY_SIM_PAGE_CACHE_64K;
 	int MAX_EVICT_ATTEMPTS;
 	double PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION;
+	double TOO_MANY_CONNECTIONS_CLOSED_RESET_DELAY;
+	int TOO_MANY_CONNECTIONS_CLOSED_TIMEOUT;
 
 	//AsyncFileKAIO
 	int MAX_OUTSTANDING;
 	int MIN_SUBMIT;
 
 	int PAGE_WRITE_CHECKSUM_HISTORY;
+	int DISABLE_POSIX_KERNEL_AIO;
 
 	//AsyncFileNonDurable
 	double MAX_PRIOR_MODIFICATION_DELAY;

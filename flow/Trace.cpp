@@ -19,27 +19,31 @@
  */
 
 
-#include "Trace.h"
-#include "FileTraceLogWriter.h"
-#include "XmlTraceLogFormatter.h"
-#include "flow.h"
-#include "DeterministicRandom.h"
+#include "flow/Trace.h"
+#include "flow/FileTraceLogWriter.h"
+#include "flow/XmlTraceLogFormatter.h"
+#include "flow/JsonTraceLogFormatter.h"
+#include "flow/flow.h"
+#include "flow/DeterministicRandom.h"
 #include <stdlib.h>
 #include <stdarg.h>
+#include <cctype>
 #include <time.h>
 
-#include "IThreadPool.h"
-#include "ThreadHelper.actor.h"
-#include "FastRef.h"
-#include "EventTypes.actor.h"
-#include "TDMetric.actor.h"
-#include "MetricSample.h"
+#include "flow/IThreadPool.h"
+#include "flow/ThreadHelper.actor.h"
+#include "flow/FastRef.h"
+#include "flow/EventTypes.actor.h"
+#include "flow/TDMetric.actor.h"
+#include "flow/MetricSample.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #undef max
 #undef min
 #endif
+
+int g_trace_depth = 0;
 
 class DummyThreadPool : public IThreadPool, ReferenceCounted<DummyThreadPool> {
 public:
@@ -122,10 +126,10 @@ static int TRACE_LOG_MAX_PREOPEN_BUFFER = 1000000;
 static int TRACE_EVENT_MAX_SIZE = 4000;
 
 struct TraceLog {
+	Reference<ITraceLogFormatter> formatter;
 
 private:
 	Reference<ITraceLogWriter> logWriter;
-	Reference<ITraceLogFormatter> formatter;
 	std::vector<TraceEventFields> eventBuffer;
 	int loggedLength;
 	int bufferLength;
@@ -331,7 +335,7 @@ public:
 
 	void annotateEvent( TraceEventFields &fields ) {
 		if(localAddress.present()) {
-			fields.addField("Machine", format("%d.%d.%d.%d:%d", (localAddress.get().ip>>24)&0xff, (localAddress.get().ip>>16)&0xff, (localAddress.get().ip>>8)&0xff, localAddress.get().ip&0xff, localAddress.get().port));
+			fields.addField("Machine", formatIpPort(localAddress.get().ip, localAddress.get().port));
 		}
 
 		fields.addField("LogGroup", logGroup);
@@ -562,6 +566,42 @@ TraceEventFields LatestEventCache::getLatestError() {
 
 static TraceLog g_traceLog;
 
+namespace {
+template <bool validate>
+bool traceFormatImpl(std::string& format) {
+	std::transform(format.begin(), format.end(), format.begin(), ::tolower);
+	if (format == "xml") {
+		if (!validate) {
+			g_traceLog.formatter = Reference<ITraceLogFormatter>(new XmlTraceLogFormatter());
+		}
+		return true;
+	} else if (format == "json") {
+		if (!validate) {
+			g_traceLog.formatter = Reference<ITraceLogFormatter>(new JsonTraceLogFormatter());
+		}
+		return true;
+	} else {
+		if (!validate) {
+			g_traceLog.formatter = Reference<ITraceLogFormatter>(new XmlTraceLogFormatter());
+		}
+		return false;
+	}
+}
+} // namespace
+
+bool selectTraceFormatter(std::string format) {
+	ASSERT(!g_traceLog.isOpen());
+	bool recognized = traceFormatImpl</*validate*/ false>(format);
+	if (!recognized) {
+		TraceEvent(SevWarnAlways, "UnrecognizedTraceFormat").detail("format", format);
+	}
+	return recognized;
+}
+
+bool validateTraceFormat(std::string format) {
+	return traceFormatImpl</*validate*/ true>(format);
+}
+
 ThreadFuture<Void> flushTraceFile() {
 	if (!g_traceLog.isOpen())
 		return Void();
@@ -586,7 +626,9 @@ void openTraceFile(const NetworkAddress& na, uint64_t rollsize, uint64_t maxLogs
 	if (baseOfBase.empty())
 		baseOfBase = "trace";
 
-	std::string baseName = format("%s.%03d.%03d.%03d.%03d.%d", baseOfBase.c_str(), (na.ip>>24)&0xff, (na.ip>>16)&0xff, (na.ip>>8)&0xff, na.ip&0xff, na.port);
+	std::string ip = na.ip.toString();
+	std::replace(ip.begin(), ip.end(), ':', '_'); // For IPv6, Windows doesn't accept ':' in filenames.
+	std::string baseName = format("%s.%s.%d", baseOfBase.c_str(), ip.c_str(), na.port);
 	g_traceLog.open( directory, baseName, logGroup, format("%lld", time(NULL)), rollsize, maxLogsSize, !g_network->isSimulated() ? na : Optional<NetworkAddress>());
 
 	uncancellable(recurring(&flushTraceFile, FLOW_KNOBS->TRACE_FLUSH_INTERVAL, TaskFlushTrace));
@@ -613,12 +655,18 @@ void removeTraceRole(std::string role) {
 	g_traceLog.removeRole(role);
 }
 
-TraceEvent::TraceEvent( const char* type, UID id ) : id(id), type(type), severity(SevInfo), initialized(false), enabled(true) {}
-TraceEvent::TraceEvent( Severity severity, const char* type, UID id ) : id(id), type(type), severity(severity), initialized(false), enabled(true) {}
+TraceEvent::TraceEvent( const char* type, UID id ) : id(id), type(type), severity(SevInfo), initialized(false), enabled(true) {
+	g_trace_depth++;
+}
+TraceEvent::TraceEvent( Severity severity, const char* type, UID id ) : id(id), type(type), severity(severity), initialized(false), enabled(true) {
+	g_trace_depth++;
+}
 TraceEvent::TraceEvent( TraceInterval& interval, UID id ) : id(id), type(interval.type), severity(interval.severity), initialized(false), enabled(true) {
+	g_trace_depth++;
 	init(interval);
 }
 TraceEvent::TraceEvent( Severity severity, TraceInterval& interval, UID id ) : id(id), type(interval.type), severity(severity), initialized(false), enabled(true) {
+	g_trace_depth++;
 	init(interval);
 }
 
@@ -678,7 +726,7 @@ bool TraceEvent::init() {
 		detail("Type", type);
 		if(g_network && g_network->isSimulated()) {
 			NetworkAddress local = g_network->getLocalAddress();
-			detailf("Machine", "%d.%d.%d.%d:%d", (local.ip>>24)&0xff, (local.ip>>16)&0xff, (local.ip>>8)&0xff, local.ip&0xff, local.port);
+			detail("Machine", formatIpPort(local.ip, local.port));
 		}
 		detail("ID", id);
 		if(err.isValid()) {
@@ -787,6 +835,9 @@ TraceEvent& TraceEvent::detail( std::string key, long long unsigned int value ) 
 	return detailfNoMetric( std::move(key), "%llu", value );
 }
 TraceEvent& TraceEvent::detail( std::string key, const NetworkAddress& value ) {
+	return detailImpl( std::move(key), value.toString() );
+}
+TraceEvent& TraceEvent::detail( std::string key, const IPAddress& value ) {
 	return detailImpl( std::move(key), value.toString() );
 }
 TraceEvent& TraceEvent::detail( std::string key, const UID& value ) {
@@ -930,6 +981,7 @@ TraceEvent::~TraceEvent() {
 		TraceEvent(SevError, "TraceEventDestructorError").error(e,true);
 	}
 	delete tmpEventMetric;
+	g_trace_depth--;
 }
 
 thread_local bool TraceEvent::networkThread = false;
@@ -977,7 +1029,7 @@ void TraceBatch::dump() {
 	std::string machine;
 	if(g_network->isSimulated()) {
 		NetworkAddress local = g_network->getLocalAddress();
-		machine = format("%d.%d.%d.%d:%d", (local.ip>>24)&0xff,(local.ip>>16)&0xff,(local.ip>>8)&0xff,local.ip&0xff,local.port);
+		machine = formatIpPort(local.ip, local.port);
 	}
 
 	for(int i = 0; i < attachBatch.size(); i++) {
@@ -1082,8 +1134,94 @@ std::string TraceEventFields::getValue(std::string key) const {
 		return value;
 	}
 	else {
+		TraceEvent ev(SevWarn, "TraceEventFieldNotFound");
+		ev.suppressFor(1.0);
+		if(tryGetValue("Type", value)) {
+			ev.detail("Event", value);
+		}
+		ev.detail("FieldName", key);
+
 		throw attribute_not_found();
 	}
+}
+
+namespace {
+void parseNumericValue(std::string const& s, double &outValue, bool permissive = false) {
+	double d = 0;
+	int consumed = 0;
+	int r = sscanf(s.c_str(), "%lf%n", &d, &consumed);
+	if (r == 1 && (consumed == s.size() || permissive)) {
+		outValue = d;
+		return;
+	}
+
+	throw attribute_not_found();
+}
+
+void parseNumericValue(std::string const& s, int &outValue, bool permissive = false) {
+	long long int iLong = 0;
+	int consumed = 0;
+	int r = sscanf(s.c_str(), "%lld%n", &iLong, &consumed);
+	if (r == 1 && (consumed == s.size() || permissive)) {
+		if (std::numeric_limits<int>::min() <= iLong && iLong <= std::numeric_limits<int>::max()) {
+			outValue = (int)iLong;  // Downcast definitely safe
+			return;
+		}
+		else {
+			throw attribute_too_large();
+		}
+	}
+
+	throw attribute_not_found();
+}
+
+void parseNumericValue(std::string const& s, int64_t &outValue, bool permissive = false) {
+	long long int i = 0;
+	int consumed = 0;
+	int r = sscanf(s.c_str(), "%lld%n", &i, &consumed);
+	if (r == 1 && (consumed == s.size() || permissive)) {
+		outValue = i;
+		return;
+	}
+
+	throw attribute_not_found();
+}
+
+template<class T>
+T getNumericValue(TraceEventFields const& fields, std::string key, bool permissive) {
+	std::string field = fields.getValue(key);
+
+	try {
+		T value;
+		parseNumericValue(field, value, permissive);
+		return value;
+	}
+	catch(Error &e) {
+		std::string type;
+
+		TraceEvent ev(SevWarn, "ErrorParsingNumericTraceEventField");
+		ev.error(e);
+		if(fields.tryGetValue("Type", type)) {
+			ev.detail("Event", type);
+		}
+		ev.detail("FieldName", key);
+		ev.detail("FieldValue", field);
+
+		throw;
+	}
+}
+} // namespace
+
+int TraceEventFields::getInt(std::string key, bool permissive) const {
+	return getNumericValue<int>(*this, key, permissive);
+}
+
+int64_t TraceEventFields::getInt64(std::string key, bool permissive) const {
+	return getNumericValue<int64_t>(*this, key, permissive);
+}
+
+double TraceEventFields::getDouble(std::string key, bool permissive) const {
+	return getNumericValue<double>(*this, key, permissive);
 }
 
 std::string TraceEventFields::toString() const {

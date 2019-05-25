@@ -24,8 +24,8 @@
 
 // Functions and constants documenting the organization of the reserved keyspace in the database beginning with "\xFF"
 
-#include "FDBTypes.h"
-#include "StorageServerInterface.h"
+#include "fdbclient/FDBTypes.h"
+#include "fdbclient/StorageServerInterface.h"
 
 extern const KeyRangeRef normalKeys; // '' to systemKeys.begin
 extern const KeyRangeRef systemKeys;  // [FF] to [FF][FF]
@@ -154,8 +154,12 @@ std::pair<vector<std::pair<UID, NetworkAddress>>,vector<std::pair<UID, NetworkAd
 extern const KeyRef globalKeysPrefix;
 extern const KeyRef lastEpochEndKey;
 extern const KeyRef lastEpochEndPrivateKey;
+extern const KeyRef killStorageKey;
+extern const KeyRef killStoragePrivateKey;
 extern const KeyRef rebootWhenDurableKey;
 extern const KeyRef rebootWhenDurablePrivateKey;
+extern const KeyRef primaryLocalityKey;
+extern const KeyRef primaryLocalityPrivateKey;
 extern const KeyRef fastLoggingEnabled;
 extern const KeyRef fastLoggingEnabledPrivateKey;
 
@@ -212,6 +216,9 @@ extern const KeyRangeRef fdbClientInfoPrefixRange;
 extern const KeyRef fdbClientInfoTxnSampleRate;
 extern const KeyRef fdbClientInfoTxnSizeLimit;
 
+// Request latency measurement key
+extern const KeyRef latencyBandConfigKey;
+
 // Keyspace to maintain wall clock to version map
 extern const KeyRangeRef timeKeeperPrefixRange;
 extern const KeyRef timeKeeperVersionKey;
@@ -258,6 +265,22 @@ extern const KeyRef metricConfPrefix;
 extern const KeyRef maxUIDKey;
 
 extern const KeyRef databaseLockedKey;
+extern const KeyRef metadataVersionKey;
+extern const KeyRef metadataVersionKeyEnd;
+extern const KeyRef metadataVersionRequiredValue;
 extern const KeyRef mustContainSystemMutationsKey;
+
+// Key range reserved for storing changes to monitor conf files
+extern const KeyRangeRef monitorConfKeys;
+
+extern const KeyRef restoreLeaderKey;
+extern const KeyRangeRef restoreWorkersKeys;
+
+const Key restoreWorkerKeyFor( UID const& agentID );
+
+extern const KeyRef healthyZoneKey;
+
+const Value healthyZoneValue( StringRef const& zoneId, Version version );
+std::pair<Key,Version> decodeHealthyZoneValue( ValueRef const& );
 
 #endif

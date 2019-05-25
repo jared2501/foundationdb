@@ -18,10 +18,11 @@
  * limitations under the License.
  */
 
-#include "IDiskQueue.h"
-#include "LogSystem.h"
-#include "LogSystemDiskQueueAdapter.h"
-#include "Knobs.h"
+#include "fdbserver/IDiskQueue.h"
+#include "fdbserver/LogSystem.h"
+#include "fdbserver/LogSystemDiskQueueAdapter.h"
+#include "fdbserver/Knobs.h"
+#include "flow/actorcompiler.h" // has to be last include
 
 class LogSystemDiskQueueAdapterImpl {
 public:
@@ -37,20 +38,23 @@ public:
 			if(!self->cursor->hasMessage()) {
 				loop {
 					choose {
-						when(Void _ = wait( self->cursor->getMore() )) {
+						when( wait( self->cursor->getMore() ) ) {
 							break;
 						}
-						when(Void _ = wait( self->localityChanged )) {
-							self->cursor = self->logSystem->peekSpecial( UID(), self->recoveryLoc, self->tag, self->peekLocality ? self->peekLocality->get().first : tagLocalityInvalid, self->peekLocality ? self->peekLocality->get().second : invalidVersion );
+						when( wait( self->localityChanged ) ) {
+							self->cursor = self->logSystem->peekSpecial( UID(), self->recoveryLoc, self->tag, self->peekLocality ? self->peekLocality->get().primaryLocality : tagLocalityInvalid, self->peekLocality ? self->peekLocality->get().knownCommittedVersion : invalidVersion );
 							self->localityChanged = self->peekLocality->onChange();
 						}
-						when(Void _ = wait( delay(self->peekTypeSwitches==0 ? SERVER_KNOBS->DISK_QUEUE_ADAPTER_MIN_SWITCH_TIME : SERVER_KNOBS->DISK_QUEUE_ADAPTER_MAX_SWITCH_TIME))) {
+						when( wait( delay(self->peekTypeSwitches==0 ? SERVER_KNOBS->DISK_QUEUE_ADAPTER_MIN_SWITCH_TIME : SERVER_KNOBS->DISK_QUEUE_ADAPTER_MAX_SWITCH_TIME)) ) {
 							self->peekTypeSwitches++;
-							if(self->peekTypeSwitches%2==1) {
+							if(self->peekTypeSwitches%3==1) {
 								self->cursor = self->logSystem->peek( UID(), self->recoveryLoc, self->tag, true );
 								self->localityChanged = Never();
+							} else if(self->peekTypeSwitches%3==2) {
+								self->cursor = self->logSystem->peekSpecial( UID(), self->recoveryLoc, self->tag, self->peekLocality ? self->peekLocality->get().secondaryLocality : tagLocalityInvalid, self->peekLocality ? self->peekLocality->get().knownCommittedVersion : invalidVersion );
+								self->localityChanged = self->peekLocality->onChange();
 							} else {
-								self->cursor = self->logSystem->peekSpecial( UID(), self->recoveryLoc, self->tag, self->peekLocality ? self->peekLocality->get().first : tagLocalityInvalid, self->peekLocality ? self->peekLocality->get().second : invalidVersion );
+								self->cursor = self->logSystem->peekSpecial( UID(), self->recoveryLoc, self->tag, self->peekLocality ? self->peekLocality->get().primaryLocality : tagLocalityInvalid, self->peekLocality ? self->peekLocality->get().knownCommittedVersion : invalidVersion );
 								self->localityChanged = self->peekLocality->onChange();
 							}
 						}
@@ -164,6 +168,6 @@ Future<LogSystemDiskQueueAdapter::CommitMessage> LogSystemDiskQueueAdapter::getC
 	return pcm.getFuture();
 }
 
-LogSystemDiskQueueAdapter* openDiskQueueAdapter( Reference<ILogSystem> logSystem, Tag tag, Reference<AsyncVar<std::pair<int8_t,Version>>> peekLocality ) {
+LogSystemDiskQueueAdapter* openDiskQueueAdapter( Reference<ILogSystem> logSystem, Tag tag, Reference<AsyncVar<PeekSpecialInfo>> peekLocality ) {
 	return new LogSystemDiskQueueAdapter( logSystem, tag, peekLocality );
 }

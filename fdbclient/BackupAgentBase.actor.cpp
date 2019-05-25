@@ -18,9 +18,81 @@
  * limitations under the License.
  */
 
-#include "BackupAgent.h"
+#include <iomanip>
+#include <time.h>
+
+#include "fdbclient/BackupAgent.actor.h"
 #include "fdbrpc/simulator.h"
 #include "flow/ActorCollection.h"
+#include "flow/actorcompiler.h" // has to be last include
+
+std::string BackupAgentBase::formatTime(int64_t epochs) {
+	time_t curTime = (time_t)epochs;
+	char buffer[30];
+	struct tm timeinfo;
+	getLocalTime(&curTime, &timeinfo);
+	strftime(buffer, 30, "%Y/%m/%d.%H:%M:%S%z", &timeinfo);
+	return buffer;
+}
+
+int64_t BackupAgentBase::parseTime(std::string timestamp) {
+	struct tm out;
+	out.tm_isdst = -1; // This field is not set by strptime. -1 tells mktime to determine whether DST is in effect
+
+	std::string timeOnly = timestamp.substr(0, 19);
+
+	// TODO:  Use std::get_time implementation for all platforms once supported
+	// It would be nice to read the timezone using %z, but it seems not all get_time()
+	// or strptime() implementations handle it correctly in all environments so we
+	// will read the date and time independent of timezone at first and then adjust it.
+#ifdef _WIN32
+	std::istringstream s(timeOnly);
+	s.imbue(std::locale(setlocale(LC_TIME, nullptr)));
+	s >> std::get_time(&out, "%Y/%m/%d.%H:%M:%S");
+	if (s.fail()) {
+		return -1;
+	}
+#else
+	if(strptime(timeOnly.c_str(), "%Y/%m/%d.%H:%M:%S", &out) == nullptr) {
+		return -1;
+	}
+#endif
+
+	// Read timezone offset in +/-HHMM format then convert to seconds
+	int tzHH;
+	int tzMM;
+	if(sscanf(timestamp.substr(19, 5).c_str(), "%3d%2d", &tzHH, &tzMM) != 2) {
+		return -1;
+	}
+	if(tzHH < 0) {
+		tzMM = -tzMM;
+	}
+	// tzOffset is the number of seconds EAST of GMT
+	int tzOffset = tzHH * 60 * 60 + tzMM * 60;
+
+	// The goal is to convert the timestamp string to epoch seconds assuming the date/time was expressed in the timezone at the end of the string.
+	// However, mktime() will ONLY return epoch seconds assuming the date/time is expressed in local time (based on locale / environment)
+	// mktime() will set out.tm_gmtoff when available
+	int64_t ts = mktime(&out);
+
+	// localTZOffset is the number of seconds EAST of GMT
+	long localTZOffset;
+#ifdef _WIN32
+	// _get_timezone() returns the number of seconds WEST of GMT
+	if(_get_timezone(&localTZOffset) != 0) {
+		return -1;
+	}
+	// Negate offset to match the orientation of tzOffset
+	localTZOffset = -localTZOffset;
+#else
+	// tm.tm_gmtoff is the number of seconds EAST of GMT
+	localTZOffset = out.tm_gmtoff;
+#endif
+
+	// Add back the difference between the local timezone assumed by mktime() and the intended timezone from the input string
+	ts += (localTZOffset - tzOffset);
+	return ts;
+}
 
 const Key BackupAgentBase::keyFolderId = LiteralStringRef("config_folderid");
 const Key BackupAgentBase::keyBeginVersion = LiteralStringRef("beginVersion");
@@ -347,7 +419,7 @@ ACTOR Future<Void> readCommitted(Database cx, PromiseStream<RangeResultWithVersi
 
 			//add lock
 			releaser.release();
-			Void _ = wait(lock->take(TaskDefaultYield, limits.bytes + CLIENT_KNOBS->VALUE_SIZE_LIMIT + CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT));
+			wait(lock->take(TaskDefaultYield, limits.bytes + CLIENT_KNOBS->VALUE_SIZE_LIMIT + CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT));
 			releaser = FlowLock::Releaser(*lock, limits.bytes + CLIENT_KNOBS->VALUE_SIZE_LIMIT + CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT);
 
 			state Standalone<RangeResultRef> values = wait(tr.getRange(begin, end, limits));
@@ -358,7 +430,7 @@ ACTOR Future<Void> readCommitted(Database cx, PromiseStream<RangeResultWithVersi
 				values.more = true;
 				// Half of the time wait for this tr to expire so that the next read is at a different version
 				if(g_random->random01() < 0.5)
-					Void _ = wait(delay(6.0));
+					wait(delay(6.0));
 			}
 
 			releaser.remaining -= values.expectedSize(); //its the responsibility of the caller to release after this point
@@ -376,9 +448,14 @@ ACTOR Future<Void> readCommitted(Database cx, PromiseStream<RangeResultWithVersi
 			}
 		}
 		catch (Error &e) {
-			if (e.code() != error_code_transaction_too_old && e.code() != error_code_future_version)
-				throw;
-			tr = Transaction(cx);
+			if (e.code() == error_code_transaction_too_old) {
+				// We are using this transaction until it's too old and then resetting to a fresh one,
+				// so we don't need to delay.
+				tr.fullReset();
+			}
+			else {
+				wait(tr.onError(e));
+			}
 		}
 	}
 }
@@ -412,13 +489,13 @@ ACTOR Future<Void> readCommitted(Database cx, PromiseStream<RCGroup> results, Fu
 				rangevalue.more = true;
 				// Half of the time wait for this tr to expire so that the next read is at a different version
 				if(g_random->random01() < 0.5)
-					Void _ = wait(delay(6.0));
+					wait(delay(6.0));
 			}
 
 			//add lock
-			Void _ = wait(active);
+			wait(active);
 			releaser.release();
-			Void _ = wait(lock->take(TaskDefaultYield, rangevalue.expectedSize() + rcGroup.items.expectedSize()));
+			wait(lock->take(TaskDefaultYield, rangevalue.expectedSize() + rcGroup.items.expectedSize()));
 			releaser = FlowLock::Releaser(*lock, rangevalue.expectedSize() + rcGroup.items.expectedSize());
 
 			int index(0);
@@ -467,9 +544,14 @@ ACTOR Future<Void> readCommitted(Database cx, PromiseStream<RCGroup> results, Fu
 			nextKey = firstGreaterThan(rangevalue.end()[-1].key);
 		}
 		catch (Error &e) {
-			if (e.code() != error_code_transaction_too_old && e.code() != error_code_future_version)
-				throw;
-			Void _ = wait(tr.onError(e));
+			if (e.code() == error_code_transaction_too_old) {
+				// We are using this transaction until it's too old and then resetting to a fresh one,
+				// so we don't need to delay.
+				tr.fullReset();
+			}
+			else {
+				wait(tr.onError(e));
+			}
 		}
 	}
 }
@@ -496,7 +578,7 @@ ACTOR Future<int> dumpData(Database cx, PromiseStream<RCGroup> results, Referenc
 				for(int i = 0; i < group.items.size(); ++i) {
 					bw.serializeBytes(group.items[i].value);
 				}
-				decodeBackupLogValue(req.arena, req.transaction.mutations, mutationSize, bw.toStringRef(), addPrefix, removePrefix, group.groupKey, keyVersion);
+				decodeBackupLogValue(req.arena, req.transaction.mutations, mutationSize, bw.toValue(), addPrefix, removePrefix, group.groupKey, keyVersion);
 				newBeginVersion = group.groupKey + 1;
 				if(mutationSize >= CLIENT_KNOBS->BACKUP_LOG_WRITE_BATCH_MAX_SIZE) {
 					break;
@@ -532,7 +614,7 @@ ACTOR Future<int> dumpData(Database cx, PromiseStream<RCGroup> results, Referenc
 		req.flags = req.flags | CommitTransactionRequest::FLAG_IS_LOCK_AWARE;
 
 		totalBytes += mutationSize;
-		Void _ = wait( commitLock->take(TaskDefaultYield, mutationSize) );
+		wait( commitLock->take(TaskDefaultYield, mutationSize) );
 		addActor.send( commitLock->releaseWhen( success(commit.getReply(req)), mutationSize ) );
 
 		if(endOfStream) {
@@ -572,7 +654,7 @@ ACTOR Future<Void> coalesceKeyVersionCache(Key uid, Version endVersion, Referenc
 		req.transaction.read_snapshot = committedVersion->get();
 		req.flags = req.flags | CommitTransactionRequest::FLAG_IS_LOCK_AWARE;
 
-		Void _ = wait( commitLock->take(TaskDefaultYield, mutationSize) );
+		wait( commitLock->take(TaskDefaultYield, mutationSize) );
 		addActor.send( commitLock->releaseWhen( success(commit.getReply(req)), mutationSize ) );
 	}
 
@@ -585,10 +667,12 @@ ACTOR Future<Void> applyMutations(Database cx, Key uid, Key addPrefix, Key remov
 	state Future<Void> error = actorCollection( addActor.getFuture() );
 	state int maxBytes = CLIENT_KNOBS->APPLY_MIN_LOCK_BYTES;
 
+	keyVersion->insert(metadataVersionKey, 0);
+
 	try {
 		loop {
 			if(beginVersion >= *endVersion) {
-				Void _ = wait( commitLock.take(TaskDefaultYield, CLIENT_KNOBS->BACKUP_LOCK_BYTES) );
+				wait( commitLock.take(TaskDefaultYield, CLIENT_KNOBS->BACKUP_LOCK_BYTES) );
 				commitLock.release(CLIENT_KNOBS->BACKUP_LOCK_BYTES);
 				if(beginVersion >= *endVersion) {
 					return Void();
@@ -616,7 +700,7 @@ ACTOR Future<Void> applyMutations(Database cx, Key uid, Key addPrefix, Key remov
 				if(error.isError()) throw error.getError();
 			}
 
-			Void _ = wait(coalesceKeyVersionCache(uid, newEndVersion, keyVersion, commit, committedVersion, addActor, &commitLock));
+			wait(coalesceKeyVersionCache(uid, newEndVersion, keyVersion, commit, committedVersion, addActor, &commitLock));
 			beginVersion = newEndVersion;
 		}
 	} catch( Error &e ) {
@@ -716,7 +800,7 @@ ACTOR static Future<Void> _eraseLogData(Database cx, Key logUidValue, Key destUi
 					}
 				}
 			}
-			Void _ = wait(tr->commit());
+			wait(tr->commit());
 
 			if (!endVersion.present() && (backupVersions.size() == 1 || currEndVersion >= nextSmallestVersion)) {
 				return Void();
@@ -726,7 +810,7 @@ ACTOR static Future<Void> _eraseLogData(Database cx, Key logUidValue, Key destUi
 			}
 			tr->reset();
 		} catch (Error &e) {
-			Void _ = wait(tr->onError(e));
+			wait(tr->onError(e));
 		}
 	}
 }
