@@ -20,7 +20,9 @@
 
 #ifndef FDBSERVER_LOGSYSTEM_H
 #define FDBSERVER_LOGSYSTEM_H
-#pragma once
+
+#include <set>
+#include <vector>
 
 #include "fdbserver/TLogInterface.h"
 #include "fdbserver/WorkerInterface.actor.h"
@@ -31,6 +33,8 @@
 #include "fdbrpc/Replication.h"
 
 struct DBCoreState;
+struct TLogSet;
+struct CoreTLogSet;
 
 class LogSet : NonCopyable, public ReferenceCounted<LogSet> {
 public:
@@ -51,6 +55,8 @@ public:
 	std::vector<std::vector<int>> satelliteTagLocations;
 
 	LogSet() : tLogWriteAntiQuorum(0), tLogReplicationFactor(0), isLocal(true), locality(tagLocalityInvalid), startVersion(invalidVersion) {}
+	LogSet(const TLogSet& tlogSet);
+	LogSet(const CoreTLogSet& coreSet);
 
 	std::string logRouterString() {
 		std::string result;
@@ -61,6 +67,15 @@ public:
 			result += logRouters[i]->get().id().toString();
 		}
 		return result;
+	}
+
+	bool hasLogRouter(UID id) {
+		for (const auto& router : logRouters) {
+			if (router->get().id() == id) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	std::string logServerString() {
@@ -74,9 +89,9 @@ public:
 		return result;
 	}
 
-	void populateSatelliteTagLocations(int logRouterTags, int oldLogRouterTags) {
+	void populateSatelliteTagLocations(int logRouterTags, int oldLogRouterTags, int txsTags, int oldTxsTags) {
 		satelliteTagLocations.clear();
-		satelliteTagLocations.resize(std::max(logRouterTags,oldLogRouterTags) + 1);
+		satelliteTagLocations.resize(std::max({logRouterTags,oldLogRouterTags,txsTags,oldTxsTags})+1);
 
 		std::map<int,int> server_usedBest;
 		std::set<std::pair<int,int>> used_servers;
@@ -189,7 +204,7 @@ public:
 		return tag.id % logServers.size();
 	}
 
-	void updateLocalitySet( vector<LocalityData> const& localities ) {
+	void updateLocalitySet( std::vector<LocalityData> const& localities ) {
 		LocalityMap<int>* logServerMap;
 
 		logServerSet = Reference<LocalitySet>(new LocalityMap<int>());
@@ -216,10 +231,11 @@ public:
 		return resultEntries.size() == 0;
 	}
 
-	void getPushLocations( std::vector<Tag> const& tags, std::vector<int>& locations, int locationOffset ) {
+	void getPushLocations(VectorRef<Tag> tags, std::vector<int>& locations, int locationOffset,
+	                      bool allLocations = false) {
 		if(locality == tagLocalitySatellite) {
 			for(auto& t : tags) {
-				if(t == txsTag || t.locality == tagLocalityLogRouter) {
+				if(t == txsTag || t.locality == tagLocalityTxs || t.locality == tagLocalityLogRouter) {
 					for(int loc : satelliteTagLocations[t == txsTag ? 0 : t.id + 1]) {
 						locations.push_back(locationOffset + loc);
 					}
@@ -233,9 +249,17 @@ public:
 		alsoServers.clear();
 		resultEntries.clear();
 
-		for(auto& t : tags) {
-			if(locality == tagLocalitySpecial || t.locality == locality || t.locality < 0) {
-				newLocations.push_back(bestLocationFor(t));
+		if (allLocations) {
+			// special handling for allLocations
+			TraceEvent("AllLocationsSet");
+			for (int i = 0; i < logServers.size(); i++) {
+				newLocations.push_back(i);
+			}
+		} else {
+			for (auto& t : tags) {
+				if (locality == tagLocalitySpecial || t.locality == locality || t.locality < 0) {
+					newLocations.push_back(bestLocationFor(t));
+				}
 			}
 		}
 
@@ -277,15 +301,15 @@ struct ILogSystem {
 		//clones the peek cursor, however you cannot call getMore() on the cloned cursor.
 		virtual Reference<IPeekCursor> cloneNoMore() = 0;
 
-		virtual void setProtocolVersion( uint64_t version ) = 0;
+		virtual void setProtocolVersion( ProtocolVersion version ) = 0;
 
 		//if hasMessage() returns true, getMessage(), getMessageWithTags(), or reader() can be called.
 		//does not modify the cursor
 		virtual bool hasMessage() = 0;
 
 		//pre: only callable if hasMessage() returns true
-		//return the tags associated with the message for teh current sequence
-		virtual const std::vector<Tag>& getTags() = 0;
+		//return the tags associated with the message for the current sequence
+		virtual VectorRef<Tag> getTags() = 0;
 
 		//pre: only callable if hasMessage() returns true
 		//returns the arena containing the contents of getMessage(), getMessageWithTags(), and reader()
@@ -316,8 +340,8 @@ struct ILogSystem {
 		virtual void advanceTo(LogMessageVersion n) = 0;
 
 		//returns immediately if hasMessage() returns true.
-		//returns when either the result of hasMessage() or version() has changed.
-		virtual Future<Void> getMore(int taskID = TaskTLogPeekReply) = 0;
+		//returns when either the result of hasMessage() or version() has changed, or a cursor has internally been exhausted.
+		virtual Future<Void> getMore(TaskPriority taskID = TaskPriority::TLogPeekReply) = 0;
 
 		//returns when the failure monitor detects that the servers associated with the cursor are failed
 		virtual Future<Void> onFailed() = 0;
@@ -358,12 +382,13 @@ struct ILogSystem {
 		LogMessageVersion messageVersion, end;
 		Version poppedVersion;
 		int32_t messageLength, rawLength;
-		std::vector<Tag> tags;
+		VectorRef<Tag> tags;
 		bool hasMsg;
 		Future<Void> more;
 		UID randomID;
 		bool returnIfBlocked;
 
+		bool onlySpilled;
 		bool parallelGetMore;
 		int sequence;
 		Deque<Future<TLogPeekReply>> futureResults;
@@ -373,16 +398,16 @@ struct ILogSystem {
 		ServerPeekCursor( TLogPeekReply const& results, LogMessageVersion const& messageVersion, LogMessageVersion const& end, int32_t messageLength, int32_t rawLength, bool hasMsg, Version poppedVersion, Tag tag );
 
 		virtual Reference<IPeekCursor> cloneNoMore();
-		virtual void setProtocolVersion( uint64_t version );
+		virtual void setProtocolVersion( ProtocolVersion version );
 		virtual Arena& arena();
 		virtual ArenaReader* reader();
 		virtual bool hasMessage();
 		virtual void nextMessage();
 		virtual StringRef getMessage();
 		virtual StringRef getMessageWithTags();
-		virtual const std::vector<Tag>& getTags();
+		virtual VectorRef<Tag> getTags();
 		virtual void advanceTo(LogMessageVersion n);
-		virtual Future<Void> getMore(int taskID = TaskTLogPeekReply);
+		virtual Future<Void> getMore(TaskPriority taskID = TaskPriority::TLogPeekReply);
 		virtual Future<Void> onFailed();
 		virtual bool isActive();
 		virtual bool isExhausted();
@@ -403,7 +428,7 @@ struct ILogSystem {
 
 	struct MergedPeekCursor : IPeekCursor, ReferenceCounted<MergedPeekCursor> {
 		Reference<LogSet> logSet;
-		vector< Reference<IPeekCursor> > serverCursors;
+		std::vector< Reference<IPeekCursor> > serverCursors;
 		std::vector<LocalityEntry> locations;
 		std::vector< std::pair<LogMessageVersion, int> > sortedVersions;
 		Tag tag;
@@ -413,13 +438,14 @@ struct ILogSystem {
 		bool hasNextMessage;
 		UID randomID;
 		int tLogReplicationFactor;
+		Future<Void> more;
 
-		MergedPeekCursor( vector< Reference<ILogSystem::IPeekCursor> > const& serverCursors, Version begin );
+		MergedPeekCursor( std::vector< Reference<ILogSystem::IPeekCursor> > const& serverCursors, Version begin );
 		MergedPeekCursor( std::vector<Reference<AsyncVar<OptionalInterface<TLogInterface>>>> const& logServers, int bestServer, int readQuorum, Tag tag, Version begin, Version end, bool parallelGetMore, std::vector<LocalityData> const& tLogLocalities, Reference<IReplicationPolicy> const tLogPolicy, int tLogReplicationFactor );
-		MergedPeekCursor( vector< Reference<IPeekCursor> > const& serverCursors, LogMessageVersion const& messageVersion, int bestServer, int readQuorum, Optional<LogMessageVersion> nextVersion, Reference<LogSet> logSet, int tLogReplicationFactor );
+		MergedPeekCursor( std::vector< Reference<IPeekCursor> > const& serverCursors, LogMessageVersion const& messageVersion, int bestServer, int readQuorum, Optional<LogMessageVersion> nextVersion, Reference<LogSet> logSet, int tLogReplicationFactor );
 
 		virtual Reference<IPeekCursor> cloneNoMore();
-		virtual void setProtocolVersion( uint64_t version );
+		virtual void setProtocolVersion( ProtocolVersion version );
 		virtual Arena& arena();
 		virtual ArenaReader* reader();
 		void calcHasMessage();
@@ -428,9 +454,9 @@ struct ILogSystem {
 		virtual void nextMessage();
 		virtual StringRef getMessage();
 		virtual StringRef getMessageWithTags();
-		virtual const std::vector<Tag>& getTags();
+		virtual VectorRef<Tag> getTags();
 		virtual void advanceTo(LogMessageVersion n);
-		virtual Future<Void> getMore(int taskID = TaskTLogPeekReply);
+		virtual Future<Void> getMore(TaskPriority taskID = TaskPriority::TLogPeekReply);
 		virtual Future<Void> onFailed();
 		virtual bool isActive();
 		virtual bool isExhausted();
@@ -459,12 +485,13 @@ struct ILogSystem {
 		bool hasNextMessage;
 		bool useBestSet;
 		UID randomID;
+		Future<Void> more;
 
 		SetPeekCursor( std::vector<Reference<LogSet>> const& logSets, int bestSet, int bestServer, Tag tag, Version begin, Version end, bool parallelGetMore );
 		SetPeekCursor( std::vector<Reference<LogSet>> const& logSets, std::vector< std::vector< Reference<IPeekCursor> > > const& serverCursors, LogMessageVersion const& messageVersion, int bestSet, int bestServer, Optional<LogMessageVersion> nextVersion, bool useBestSet );
 
 		virtual Reference<IPeekCursor> cloneNoMore();
-		virtual void setProtocolVersion( uint64_t version );
+		virtual void setProtocolVersion( ProtocolVersion version );
 		virtual Arena& arena();
 		virtual ArenaReader* reader();
 		void calcHasMessage();
@@ -473,9 +500,9 @@ struct ILogSystem {
 		virtual void nextMessage();
 		virtual StringRef getMessage();
 		virtual StringRef getMessageWithTags();
-		virtual const std::vector<Tag>& getTags();
+		virtual VectorRef<Tag> getTags();
 		virtual void advanceTo(LogMessageVersion n);
-		virtual Future<Void> getMore(int taskID = TaskTLogPeekReply);
+		virtual Future<Void> getMore(TaskPriority taskID = TaskPriority::TLogPeekReply);
 		virtual Future<Void> onFailed();
 		virtual bool isActive();
 		virtual bool isExhausted();
@@ -500,16 +527,16 @@ struct ILogSystem {
 		MultiCursor( std::vector<Reference<IPeekCursor>> cursors, std::vector<LogMessageVersion> epochEnds );
 
 		virtual Reference<IPeekCursor> cloneNoMore();
-		virtual void setProtocolVersion( uint64_t version );
+		virtual void setProtocolVersion( ProtocolVersion version );
 		virtual Arena& arena();
 		virtual ArenaReader* reader();
 		virtual bool hasMessage();
 		virtual void nextMessage();
 		virtual StringRef getMessage();
 		virtual StringRef getMessageWithTags();
-		virtual const std::vector<Tag>& getTags();
+		virtual VectorRef<Tag> getTags();
 		virtual void advanceTo(LogMessageVersion n);
-		virtual Future<Void> getMore(int taskID = TaskTLogPeekReply);
+		virtual Future<Void> getMore(TaskPriority taskID = TaskPriority::TLogPeekReply);
 		virtual Future<Void> onFailed();
 		virtual bool isActive();
 		virtual bool isExhausted();
@@ -530,11 +557,12 @@ struct ILogSystem {
 		struct BufferedMessage {
 			Arena arena;
 			StringRef message;
-			std::vector<Tag> tags;
+			VectorRef<Tag> tags;
 			LogMessageVersion version;
 
 			BufferedMessage() {}
-			BufferedMessage( Arena arena, StringRef message, const std::vector<Tag>& tags, const LogMessageVersion& version ) : arena(arena), message(message), tags(tags), version(version) {}
+			explicit BufferedMessage( Version version ) : version(version) {}
+			BufferedMessage( Arena arena, StringRef message, const VectorRef<Tag>& tags, const LogMessageVersion& version ) : arena(arena), message(message), tags(tags), version(version) {}
 
 			bool operator < (BufferedMessage const& r) const {
 				return version < r.version;
@@ -546,30 +574,40 @@ struct ILogSystem {
 		};
 
 		std::vector<Reference<IPeekCursor>> cursors;
+		std::vector<Deque<BufferedMessage>> cursorMessages;
 		std::vector<BufferedMessage> messages;
 		int messageIndex;
 		LogMessageVersion messageVersion;
 		Version end;
 		bool hasNextMessage;
+		bool withTags;
+		bool knownUnique;
+		Version minKnownCommittedVersion;
+		Version poppedVersion;
+		Version initialPoppedVersion;
+		bool canDiscardPopped;
+		Future<Void> more;
+		int targetQueueSize;
+		UID randomID;
 
 		//FIXME: collectTags is needed to support upgrades from 5.X to 6.0. Remove this code when we no longer support that upgrade.
 		bool collectTags;
-		std::vector<Tag> tags;
 		void combineMessages();
 
-		BufferedCursor( std::vector<Reference<IPeekCursor>> cursors, Version begin, Version end, bool collectTags );
+		BufferedCursor( std::vector<Reference<IPeekCursor>> cursors, Version begin, Version end, bool withTags, bool collectTags, bool canDiscardPopped );
+		BufferedCursor( std::vector<Reference<AsyncVar<OptionalInterface<TLogInterface>>>> const& logServers, Tag tag, Version begin, Version end, bool parallelGetMore );
 
 		virtual Reference<IPeekCursor> cloneNoMore();
-		virtual void setProtocolVersion( uint64_t version );
+		virtual void setProtocolVersion( ProtocolVersion version );
 		virtual Arena& arena();
 		virtual ArenaReader* reader();
 		virtual bool hasMessage();
 		virtual void nextMessage();
 		virtual StringRef getMessage();
 		virtual StringRef getMessageWithTags();
-		virtual const std::vector<Tag>& getTags();
+		virtual VectorRef<Tag> getTags();
 		virtual void advanceTo(LogMessageVersion n);
-		virtual Future<Void> getMore(int taskID = TaskTLogPeekReply);
+		virtual Future<Void> getMore(TaskPriority taskID = TaskPriority::TLogPeekReply);
 		virtual Future<Void> onFailed();
 		virtual bool isActive();
 		virtual bool isExhausted();
@@ -613,7 +651,7 @@ struct ILogSystem {
 		// Returns when the preceding changes are durable.  (Later we will need multiple return signals for diffferent durability levels)
 		// If the current epoch has ended, push will not return, and the pushed messages will not be visible in any subsequent epoch (but may become visible in this epoch)
 
-	virtual Reference<IPeekCursor> peek( UID dbgid, Version begin, Tag tag, bool parallelGetMore = false ) = 0;
+	virtual Reference<IPeekCursor> peek( UID dbgid, Version begin, Optional<Version> end, Tag tag, bool parallelGetMore = false ) = 0;
 		// Returns (via cursor interface) a stream of messages with the given tag and message versions >= (begin, 0), ordered by message version
 		// If pop was previously or concurrently called with upTo > begin, the cursor may not return all such messages.  In that case cursor->popped() will
 		// be greater than begin to reflect that.
@@ -621,19 +659,23 @@ struct ILogSystem {
 	virtual Reference<IPeekCursor> peek( UID dbgid, Version begin, Optional<Version> end, std::vector<Tag> tags, bool parallelGetMore = false ) = 0;
 		// Same contract as peek(), but for a set of tags
 
-	virtual Reference<IPeekCursor> peekSingle( UID dbgid, Version begin, Tag tag, vector<pair<Version,Tag>> history = vector<pair<Version,Tag>>() ) = 0;
+	virtual Reference<IPeekCursor> peekSingle( UID dbgid, Version begin, Tag tag, std::vector<std::pair<Version,Tag>> history = std::vector<std::pair<Version,Tag>>() ) = 0;
 		// Same contract as peek(), but blocks until the preferred log server(s) for the given tag are available (and is correspondingly less expensive)
 
 	virtual Reference<IPeekCursor> peekLogRouter( UID dbgid, Version begin, Tag tag ) = 0;
 		// Same contract as peek(), but can only peek from the logs elected in the same generation.
 		// If the preferred log server is down, a different log from the same generation will merge results locally before sending them to the log router.
 
-	virtual Reference<IPeekCursor> peekSpecial( UID dbgid, Version begin, Tag tag, int8_t peekLocality, Version localEnd ) = 0;
-		// Same contract as peek(), but it allows specifying a preferred peek locality for tags that do not have locality
+	virtual Reference<IPeekCursor> peekTxs( UID dbgid, Version begin, int8_t peekLocality, Version localEnd, bool canDiscardPopped ) = 0;
+		// Same contract as peek(), but only for peeking the txsLocality. It allows specifying a preferred peek locality.
+
+	virtual Future<Version> getTxsPoppedVersion() = 0;
 
 	virtual Version getKnownCommittedVersion() = 0;
 
 	virtual Future<Void> onKnownCommittedVersionChange() = 0;
+
+	virtual void popTxs( Version upTo, int8_t popLocality = tagLocalityInvalid ) = 0;
 
 	virtual void pop( Version upTo, Tag tag, Version knownCommittedVersion = 0, int8_t popLocality = tagLocalityInvalid ) = 0;
 		// Permits, but does not require, the log subsystem to strip `tag` from any or all messages with message versions < (upTo,0)
@@ -675,13 +717,31 @@ struct ILogSystem {
 	virtual Future<Void> onLogSystemConfigChange() = 0;
 		// Returns when the log system configuration has changed due to a tlog rejoin.
 
-	virtual void getPushLocations( std::vector<Tag> const& tags, vector<int>& locations ) = 0;
+	virtual void getPushLocations(VectorRef<Tag> tags, std::vector<int>& locations, bool allLocations = false) = 0;
 
-	virtual bool hasRemoteLogs() = 0;
+	void getPushLocations(std::vector<Tag> const& tags, std::vector<int>& locations, bool allLocations = false) {
+		getPushLocations(VectorRef<Tag>((Tag*)&tags.front(), tags.size()), locations, allLocations);
+	}
 
-	virtual Tag getRandomRouterTag() = 0;
+	virtual bool hasRemoteLogs() const = 0;
+
+	virtual Tag getRandomRouterTag() const = 0;
+
+	virtual Tag getRandomTxsTag() const = 0;
+
+	// Returns the TLogVersion of the current generation of TLogs.
+	// (This only exists because getLogSystemConfig is a significantly more expensive call.)
+	virtual TLogVersion getTLogVersion() const = 0;
 
 	virtual void stopRejoins() = 0;
+
+	// Returns the pseudo tag to be popped for the given process class. If the
+	// process class doesn't use pseudo tag, return the same tag.
+	virtual Tag getPseudoPopTag(Tag tag, ProcessClass::ClassType type) = 0;
+
+	virtual bool isPseudoLocality(int8_t locality) = 0;
+
+	virtual Version popPseudoLocalityTag(int8_t locality, Version upTo) = 0;
 };
 
 struct LengthPrefixedStringRef {
@@ -720,12 +780,25 @@ struct LogPushData : NonCopyable {
 		}
 	}
 
+	void addTxsTag() {
+		if ( logSystem->getTLogVersion() >= TLogVersion::V4 ) {
+			next_message_tags.push_back( logSystem->getRandomTxsTag() );
+		} else {
+			next_message_tags.push_back( txsTag );
+		}
+	}
+
 	// addTag() adds a tag for the *next* message to be added
 	void addTag( Tag tag ) {
 		next_message_tags.push_back( tag );
 	}
 
-	void addMessage( StringRef rawMessageWithoutLength, bool usePreviousLocations = false ) {
+	template<class T>
+	void addTags(T tags) {
+		next_message_tags.insert(next_message_tags.end(), tags.begin(), tags.end());
+	}
+
+	void addMessage( StringRef rawMessageWithoutLength, bool usePreviousLocations ) {
 		if( !usePreviousLocations ) {
 			prev_tags.clear();
 			if(logSystem->hasRemoteLogs()) {
@@ -739,8 +812,9 @@ struct LogPushData : NonCopyable {
 			next_message_tags.clear();
 		}
 		uint32_t subseq = this->subsequence++;
+		uint32_t msgsize = rawMessageWithoutLength.size() + sizeof(subseq) + sizeof(uint16_t) + sizeof(Tag)*prev_tags.size();
 		for(int loc : msg_locations) {
-			messagesWriter[loc] << uint32_t(rawMessageWithoutLength.size() + sizeof(subseq) + sizeof(uint16_t) + sizeof(Tag)*prev_tags.size()) << subseq << uint16_t(prev_tags.size());
+			messagesWriter[loc] << msgsize << subseq << uint16_t(prev_tags.size());
 			for(auto& tag : prev_tags)
 				messagesWriter[loc] << tag;
 			messagesWriter[loc].serializeBytes(rawMessageWithoutLength);
@@ -748,7 +822,7 @@ struct LogPushData : NonCopyable {
 	}
 
 	template <class T>
-	void addTypedMessage( T const& item ) {
+	void addTypedMessage(T const& item, bool allLocations = false) {
 		prev_tags.clear();
 		if(logSystem->hasRemoteLogs()) {
 			prev_tags.push_back( logSystem->getRandomRouterTag() );
@@ -757,8 +831,8 @@ struct LogPushData : NonCopyable {
 			prev_tags.push_back(tag);
 		}
 		msg_locations.clear();
-		logSystem->getPushLocations( prev_tags, msg_locations );
-		
+		logSystem->getPushLocations(prev_tags, msg_locations, allLocations);
+
 		uint32_t subseq = this->subsequence++;
 		for(int loc : msg_locations) {
 			// FIXME: memcpy after the first time
@@ -779,10 +853,10 @@ struct LogPushData : NonCopyable {
 
 private:
 	Reference<ILogSystem> logSystem;
-	vector<Tag> next_message_tags;
-	vector<Tag> prev_tags;
-	vector<BinaryWriter> messagesWriter;
-	vector<int> msg_locations;
+	std::vector<Tag> next_message_tags;
+	std::vector<Tag> prev_tags;
+	std::vector<BinaryWriter> messagesWriter;
+	std::vector<int> msg_locations;
 	uint32_t subsequence;
 };
 

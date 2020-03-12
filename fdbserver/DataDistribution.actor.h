@@ -38,35 +38,6 @@ struct RelocateShard {
 	RelocateShard( KeyRange const& keys, int priority ) : keys(keys), priority(priority) {}
 };
 
-// Higher priorities are executed first
-// Priority/100 is the "priority group"/"superpriority".  Priority inversion
-//   is possible within but not between priority groups; fewer priority groups
-//   mean better worst case time bounds
-enum {
-	PRIORITY_REBALANCE_SHARD = 100,
-	PRIORITY_RECOVER_MOVE    = 110,
-	PRIORITY_REBALANCE_UNDERUTILIZED_TEAM  = 120,
-	PRIORITY_REBALANCE_OVERUTILIZED_TEAM  = 121,
-	PRIORITY_TEAM_HEALTHY    = 140,
-	PRIORITY_TEAM_CONTAINS_UNDESIRED_SERVER = 150,
-
-	PRIORITY_MERGE_SHARD     = 240,
-	PRIORITY_SPLIT_SHARD     = 250,
-
-	PRIORITY_TEAM_REDUNDANT  = 700,
-	PRIORITY_TEAM_UNHEALTHY  = 800,
-	PRIORITY_TEAM_2_LEFT     = 809,
-
-	PRIORITY_TEAM_1_LEFT     = 900,
-
-	PRIORITY_TEAM_0_LEFT     = 999
-};
-
-enum {
-	SOME_SHARED = 2,
-	NONE_SHARED = 3
-};
-
 struct IDataDistributionTeam {
 	virtual vector<StorageServerInterface> getLastKnownServerInterfaces() = 0;
 	virtual int size() = 0;
@@ -77,7 +48,7 @@ struct IDataDistributionTeam {
 	virtual int64_t getMinFreeSpace( bool includeInFlight = true ) = 0;
 	virtual double getMinFreeSpaceRatio( bool includeInFlight = true ) = 0;
 	virtual bool hasHealthyFreeSpace() = 0;
-	virtual Future<Void> updatePhysicalMetrics() = 0;
+	virtual Future<Void> updateStorageMetrics() = 0;
 	virtual void addref() = 0;
 	virtual void delref() = 0;
 	virtual bool isHealthy() = 0;
@@ -105,7 +76,6 @@ struct GetTeamRequest {
 	bool wantsTrueBest;
 	bool preferLowerUtilization;
 	double inflightPenalty;
-	std::vector<UID> sources;
 	std::vector<UID> completeSources;
 	Promise< Optional< Reference<IDataDistributionTeam> > > reply;
 
@@ -128,7 +98,7 @@ struct TeamCollectionInterface {
 class ShardsAffectedByTeamFailure : public ReferenceCounted<ShardsAffectedByTeamFailure> {
 public:
 	ShardsAffectedByTeamFailure() {}
-	
+
 	struct Team {
 		vector<UID> servers;  // sorted
 		bool primary;
@@ -138,7 +108,7 @@ public:
 
 		bool operator < ( const Team& r ) const {
 			if( servers == r.servers ) return primary < r.primary;
-			return servers < r.servers; 
+			return servers < r.servers;
 		}
 		bool operator == ( const Team& r ) const {
 			return servers == r.servers && primary == r.primary;
@@ -206,6 +176,7 @@ struct InitialDataDistribution : ReferenceCounted<InitialDataDistribution> {
 	std::set<vector<UID>> primaryTeams;
 	std::set<vector<UID>> remoteTeams;
 	vector<DDShardInfo> shards;
+	Optional<Key> initHealthyZoneValue;
 };
 
 Future<Void> dataDistributionTracker(
@@ -250,9 +221,8 @@ ShardSizeBounds getShardSizeBounds(KeyRangeRef shard, int64_t maxShardSize);
 //Determines the maximum shard size based on the size of the database
 int64_t getMaxShardSize( double dbSizeEstimate );
 
-class DDTeamCollection;
-ACTOR Future<Void> teamRemover(DDTeamCollection* self);
-ACTOR Future<Void> teamRemoverPeriodic(DDTeamCollection* self);
+struct DDTeamCollection;
 ACTOR Future<vector<std::pair<StorageServerInterface, ProcessClass>>> getServerListAndProcessClasses(Transaction* tr);
 
+#include "flow/unactorcompiler.h"
 #endif

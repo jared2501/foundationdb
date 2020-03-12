@@ -94,10 +94,9 @@ struct PageChecksumCodec {
 		SumType *pSumInPage = (SumType *)(pData + dataLen);
 
 		if (write) {
-			// Always write a hashlittle2 checksum for new pages
-			pSumInPage->part1 = pageNumber; // DO NOT CHANGE
-			pSumInPage->part2 = 0x5ca1ab1e;
-			hashlittle2(pData, dataLen, &pSumInPage->part1, &pSumInPage->part2);
+			// Always write a CRC32 checksum for new pages
+			pSumInPage->part1 = 0; // Indicates CRC32 is being used
+			pSumInPage->part2 = crc32c_append(0xfdbeefdb, static_cast<uint8_t*>(data), dataLen);
 			return true;
 		}
 
@@ -237,7 +236,7 @@ struct SQLiteDB : NonCopyable {
 	}
 
 	void checkError( const char* context, int rc ) {
-		//if (g_random->random01() < .001) rc = SQLITE_INTERRUPT;
+		//if (deterministicRandom()->random01() < .001) rc = SQLITE_INTERRUPT;
 		if (rc) {
 			// Our exceptions don't propagate through sqlite, so we don't know for sure if the error that caused this was
 			// an injected fault.  Assume that if fault injection is happening, this is an injected fault.
@@ -429,15 +428,16 @@ Value encodeKVFragment( KeyValueRef kv, uint32_t index) {
 	// a signed representation of the index value.  The type code for 0 is 0 (which is
 	// actually the null type in SQLite).
 	int8_t indexCode = 0;
-	uint32_t tmp = index;
-	while(tmp != 0) {
-		++indexCode;
-		tmp >>= 8;
+	if (index != 0) {
+		uint32_t tmp = index;
+		while (tmp != 0) {
+			++indexCode;
+			tmp >>= 8;
+		}
+		// An increment is required if the high bit of the N-byte index value is set, since it is
+		// positive number but SQLite only stores signed values and would interpret it as negative.
+		if (index >> (8 * indexCode - 1)) ++indexCode;
 	}
-	// An increment is required if the high bit of the N-byte index value is set, since it is
-	// positive number but SQLite only stores signed values and would interpret it as negative.
-	if(index >> (8 * indexCode - 1))
-		++indexCode;
 
 	int header_size = sqlite3VarintLen(keyCode) + sizeof(indexCode) + sqlite3VarintLen(valCode);
 	int hh = sqlite3VarintLen(header_size);
@@ -776,7 +776,7 @@ struct RawCursor {
 				int fragmentedWaste = kv.key.size() * (fragments - 1);
 
 				// Total bytes used for the fragmented case
-				int fragmentedTotal = kv.expectedSize() + fragmentedWaste;
+				//int fragmentedTotal = kv.expectedSize() + fragmentedWaste;
 
 				// Calculate bytes saved by having extra key instances stored vs the original partial overflow page bytes.
 				int savings = unfragmentedWaste - fragmentedWaste;
@@ -1226,7 +1226,7 @@ int SQLiteDB::checkAllPageChecksums() {
 	Statement *jm = new Statement(*this, "PRAGMA journal_mode");
 	ASSERT( jm->nextRow() );
 	if (jm->column(0) != LiteralStringRef("wal")){
-		TraceEvent(SevError, "JournalModeError").detail("Filename", filename).detail("Mode", printable(jm->column(0)));
+		TraceEvent(SevError, "JournalModeError").detail("Filename", filename).detail("Mode", jm->column(0));
 		ASSERT( false );
 	}
 	delete jm;
@@ -1307,7 +1307,7 @@ void SQLiteDB::open(bool writable) {
 			// Either we died partway through creating this DB, or died partway through deleting it, or someone is monkeying with our files
 			// Create a new blank DB by backing up the WAL file (just in case it is important) and then hitting the next case
 			walFile = file_not_found();
-			renameFile( walpath, walpath + "-old-" + g_random->randomUniqueID().toString() );
+			renameFile( walpath, walpath + "-old-" + deterministicRandom()->randomUniqueID().toString() );
 			ASSERT_WE_THINK(false);  //< This code should not be hit in FoundationDB at the moment, because worker looks for databases to open by listing .fdb files, not .fdb-wal files
 			//TEST(true);  // Replace a partially constructed or destructed DB
 		}
@@ -1344,7 +1344,7 @@ void SQLiteDB::open(bool writable) {
 	if( !g_network->isSimulated() ) {
 		chunkSize = 4096 * SERVER_KNOBS->SQLITE_CHUNK_SIZE_PAGES;
 	} else if( BUGGIFY ) {
-		chunkSize = 4096 * g_random->randomInt(0, 100);
+		chunkSize = 4096 * deterministicRandom()->randomInt(0, 100);
 	} else {
 		chunkSize = 4096 * SERVER_KNOBS->SQLITE_CHUNK_SIZE_PAGES_SIM;
 	}
@@ -1362,7 +1362,7 @@ void SQLiteDB::open(bool writable) {
 	Statement jm(*this, "PRAGMA journal_mode");
 	ASSERT( jm.nextRow() );
 	if (jm.column(0) != LiteralStringRef("wal")){
-		TraceEvent(SevError, "JournalModeError").detail("Filename", filename).detail("Mode", printable(jm.column(0)));
+		TraceEvent(SevError, "JournalModeError").detail("Filename", filename).detail("Mode", jm.column(0));
 		ASSERT( false );
 	}
 
@@ -1691,7 +1691,7 @@ private:
 			cursor = new Cursor(conn, true);
 			checkFreePages();
 			++writesComplete;
-			if (t3-a.issuedTime > 10.0*g_random->random01())
+			if (t3-a.issuedTime > 10.0*deterministicRandom()->random01())
 				TraceEvent("KVCommit10sSample", dbgid).detail("Queued", t1-a.issuedTime).detail("Commit", t2-t1).detail("Checkpoint", t3-t2);
 
 			diskBytesUsed = waitForAndGet( conn.dbFile->size() ) + waitForAndGet( conn.walFile->size() );
@@ -1766,7 +1766,7 @@ private:
 					break;
 				}
 
-				if(canDelete && (!canVacuum || g_random->random01() < lazyDeleteBatchProbability)) {
+				if(canDelete && (!canVacuum || deterministicRandom()->random01() < lazyDeleteBatchProbability)) {
 					TEST(canVacuum); // SQLite lazy deletion when vacuuming is active
 					TEST(!canVacuum); // SQLite lazy deletion when vacuuming is inactive
 
@@ -1938,8 +1938,8 @@ KeyValueStoreSQLite::KeyValueStoreSQLite(std::string const& filename, UID id, Ke
 	readCursors.resize(64); //< number of read threads
 
 	sqlite3_soft_heap_limit64( SERVER_KNOBS->SOFT_HEAP_LIMIT );  // SOMEDAY: Is this a performance issue?  Should we drop the cache sizes for individual threads?
-	int taskId = g_network->getCurrentTask();
-	g_network->setCurrentTask(TaskDiskWrite);
+	TaskPriority taskId = g_network->getCurrentTask();
+	g_network->setCurrentTask(TaskPriority::DiskWrite);
 	writeThread->addThread( new Writer(filename, type==KeyValueStoreType::SSD_BTREE_V2, checkChecksums, checkIntegrity, writesComplete, springCleaningStats, diskBytesUsed, freeListPages, id, &readCursors) );
 	g_network->setCurrentTask(taskId);
 	auto p = new Writer::InitAction();
@@ -1964,8 +1964,8 @@ StorageBytes KeyValueStoreSQLite::getStorageBytes() {
 
 void KeyValueStoreSQLite::startReadThreads() {
 	int nReadThreads = readCursors.size();
-	int taskId = g_network->getCurrentTask();
-	g_network->setCurrentTask(TaskDiskRead);
+	TaskPriority taskId = g_network->getCurrentTask();
+	g_network->setCurrentTask(TaskPriority::DiskRead);
 	for(int i=0; i<nReadThreads; i++)
 		readThreads->addThread( new Reader(filename, type==KeyValueStoreType::SSD_BTREE_V2, readsComplete, logID, &readCursors[i]) );
 	g_network->setCurrentTask(taskId);

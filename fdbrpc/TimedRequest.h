@@ -1,9 +1,9 @@
 /*
- * FutureVersion.java
+ * TimedRequest.h
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
+ * Copyright 2013-2019 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,20 +18,28 @@
  * limitations under the License.
  */
 
-package com.apple.foundationdb;
+#ifndef FDBRPC_TIMED_REQUEST_H
+#define FDBRPC_TIMED_REQUEST_H
+#pragma once
 
-import java.util.concurrent.Executor;
+#include <fdbrpc/fdbrpc.h>
 
-class FutureVersion extends NativeFuture<Long> {
-	FutureVersion(long cPtr, Executor executor) {
-		super(cPtr);
-		registerMarshalCallback(executor);
+class TimedRequest {
+	double _requestTime;
+
+public:
+	double requestTime() const {
+		ASSERT(_requestTime > 0.0);
+		return _requestTime;
 	}
 
-	@Override
-	protected Long getIfDone_internal(long cPtr) throws FDBException {
-		return FutureVersion_get(cPtr);
+	TimedRequest() {
+		if (!FlowTransport::isClient()) {
+			_requestTime = timer();
+		} else {
+			_requestTime = 0.0;
+		}
 	}
+};
 
-	private native long FutureVersion_get(long cPtr) throws FDBException;
-}
+#endif

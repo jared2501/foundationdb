@@ -9,6 +9,7 @@ set(FLOW_SRCS
   CompressedInt.h
   Deque.cpp
   Deque.h
+  DeterministicRandom.cpp
   DeterministicRandom.h
   Error.cpp
   Error.h
@@ -63,6 +64,8 @@ set(FLOW_SRCS
   XmlTraceLogFormatter.cpp
   actorcompiler.h
   error_definitions.h
+  flat_buffers.h
+  flat_buffers.cpp
   flow.cpp
   flow.h
   genericactors.actor.cpp
@@ -84,9 +87,13 @@ if (NOT APPLE AND NOT WIN32)
   set (FLOW_LIBS ${FLOW_LIBS} rt)
 elseif(WIN32)
   target_link_libraries(flow PUBLIC winmm.lib)
+  target_link_libraries(flow PUBLIC psapi.lib)
 endif()
 target_link_libraries(flow PRIVATE ${FLOW_LIBS})
 target_link_libraries(flow PUBLIC boost_target Threads::Threads ${CMAKE_DL_LIBS})
+if(USE_VALGRIND)
+  target_link_libraries(flow PUBLIC Valgrind)
+endif()
 if(NOT WITH_TLS)
   target_compile_definitions(flow PUBLIC TLS_DISABLED)
 else()
@@ -98,4 +105,3 @@ if(APPLE)
   find_library(CORE_FOUNDATION CoreFoundation)
   target_link_libraries(flow PRIVATE ${IO_KIT} ${CORE_FOUNDATION})
 endif()
-

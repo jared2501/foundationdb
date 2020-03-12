@@ -31,6 +31,7 @@
 typedef uint64_t DBRecoveryCount;
 
 struct MasterInterface {
+	constexpr static FileIdentifier file_identifier = 5979145;
 	LocalityData locality;
 	RequestStream< ReplyPromise<Void> > waitFailure;
 	RequestStream< struct TLogRejoinRequest > tlogRejoin; // sent by tlog (whether or not rebooted) to communicate with a new master
@@ -42,18 +43,37 @@ struct MasterInterface {
 	UID id() const { return changeCoordinators.getEndpoint().token; }
 	template <class Archive>
 	void serialize(Archive& ar) {
-		ASSERT( ar.protocolVersion() >= 0x0FDB00A200040001LL );
+		if constexpr (!is_fb_function<Archive>) {
+                ASSERT( ar.protocolVersion().isValid() );
+        }
 		serializer(ar, locality, waitFailure, tlogRejoin, changeCoordinators, getCommitVersion);
 	}
 
 	void initEndpoints() {
-		getCommitVersion.getEndpoint( TaskProxyGetConsistentReadVersion );
+		getCommitVersion.getEndpoint( TaskPriority::ProxyGetConsistentReadVersion );
+		tlogRejoin.getEndpoint( TaskPriority::MasterTLogRejoin );
+	}
+};
+
+struct TLogRejoinReply {
+	constexpr static FileIdentifier file_identifier = 11;
+
+	// false means someone else registered, so we should re-register.  true means this master is recovered, so don't
+	// send again to the same master.
+	bool masterIsRecovered;
+	TLogRejoinReply() = default;
+	explicit TLogRejoinReply(bool masterIsRecovered) : masterIsRecovered(masterIsRecovered) {}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, masterIsRecovered);
 	}
 };
 
 struct TLogRejoinRequest {
+	constexpr static FileIdentifier file_identifier = 15692200;
 	TLogInterface myInterface;
-	ReplyPromise<bool> reply;   // false means someone else registered, so we should re-register.  true means this master is recovered, so don't send again to the same master.
+	ReplyPromise<TLogRejoinReply> reply;
 
 	TLogRejoinRequest() { }
 	explicit TLogRejoinRequest(const TLogInterface &interf) : myInterface(interf) { }
@@ -64,6 +84,7 @@ struct TLogRejoinRequest {
 };
 
 struct ChangeCoordinatorsRequest {
+	constexpr static FileIdentifier file_identifier = 13605416;
 	Standalone<StringRef> newConnectionString;
 	ReplyPromise<Void> reply;  // normally throws even on success!
 
@@ -77,6 +98,7 @@ struct ChangeCoordinatorsRequest {
 };
 
 struct ResolverMoveRef {
+	constexpr static FileIdentifier file_identifier = 11945475;
 	KeyRangeRef range;
 	int dest;
 
@@ -102,6 +124,7 @@ struct ResolverMoveRef {
 };
 
 struct GetCommitVersionReply {
+	constexpr static FileIdentifier file_identifier = 3568822;
 	Standalone<VectorRef<ResolverMoveRef>> resolverChanges;
 	Version resolverChangesVersion;
 	Version version;
@@ -118,6 +141,7 @@ struct GetCommitVersionReply {
 };
 
 struct GetCommitVersionRequest {
+	constexpr static FileIdentifier file_identifier = 16683181;
 	uint64_t requestNum;
 	uint64_t mostRecentProcessedRequestNum;
 	UID requestingProxy;

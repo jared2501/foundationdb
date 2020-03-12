@@ -1,16 +1,16 @@
 /*
- * MemoryPager.h
+ * FutureInt64.java
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2013-2018 Apple Inc. and the FoundationDB project authors
- * 
+ * Copyright 2013-2019 Apple Inc. and the FoundationDB project authors
+ *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *     http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,12 +18,20 @@
  * limitations under the License.
  */
 
-#ifndef FDBSERVER_MEMORYPAGER_H
-#define FDBSERVER_MEMORYPAGER_H
-#pragma once
+package com.apple.foundationdb;
 
-#include "fdbserver/IPager.h"
+import java.util.concurrent.Executor;
 
-IPager * createMemoryPager();
+class FutureInt64 extends NativeFuture<Long> {
+	FutureInt64(long cPtr, Executor executor) {
+		super(cPtr);
+		registerMarshalCallback(executor);
+	}
 
-#endif
+	@Override
+	protected Long getIfDone_internal(long cPtr) throws FDBException {
+		return FutureInt64_get(cPtr);
+	}
+
+	private native long FutureInt64_get(long cPtr) throws FDBException;
+}

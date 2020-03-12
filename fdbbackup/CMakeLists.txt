@@ -30,4 +30,17 @@ if(NOT OPEN_FOR_IDE)
     LINK_DIR bin
     FILE_NAME fdbbackup
     LINK_NAME fdbdr)
+  symlink_files(
+    LOCATION packages/bin
+    SOURCE fdbbackup
+    TARGETS fdbdr dr_agent backup_agent fdbrestore)
+  symlink_files(
+    LOCATION bin
+    SOURCE fdbbackup
+    TARGETS fdbdr dr_agent backup_agent fdbrestore)
+endif()
+
+if (GPERFTOOLS_FOUND)
+  add_compile_definitions(USE_GPERFTOOLS)
+  target_link_libraries(fdbbackup PRIVATE gperftools)
 endif()

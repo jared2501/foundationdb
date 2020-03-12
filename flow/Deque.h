@@ -42,10 +42,12 @@ public:
 
 	// TODO: iterator construction, other constructors
 	Deque(Deque const& r) : arr(0), begin(0), end(r.size()), mask(r.mask) {
-		if(r.capacity() > 0)
-			arr = (T*)aligned_alloc(__alignof(T), capacity()*sizeof(T));
+		if (r.capacity() > 0) {
+			arr = (T*)aligned_alloc(std::max(__alignof(T), sizeof(void*)), capacity() * sizeof(T));
+			ASSERT(arr != nullptr);
+		}
 		ASSERT(capacity() >= end || end == 0);
-		for(int i=0; i<end; i++)
+		for (uint32_t i=0; i<end; i++)
 			new (&arr[i]) T(r[i]);
 		// FIXME: Specialization for POD types using memcpy?
 	}
@@ -57,10 +59,12 @@ public:
 		begin = 0;
 		end = r.size();
 		mask = r.mask;
-		if(r.capacity() > 0)
-			arr = (T*)aligned_alloc(__alignof(T), capacity()*sizeof(T));
+		if (r.capacity() > 0) {
+			arr = (T*)aligned_alloc(std::max(__alignof(T), sizeof(void*)), capacity() * sizeof(T));
+			ASSERT(arr != nullptr);
+		}
 		ASSERT(capacity() >= end || end == 0);
-		for(int i=0; i<end; i++)
+		for (uint32_t i=0; i<end; i++)
 			new (&arr[i]) T(r[i]);
 		// FIXME: Specialization for POD types using memcpy?
 	}
@@ -87,7 +91,7 @@ public:
 	bool operator == (const Deque& r) const { 
 		if(size() != r.size())
 			return false;
-		for(int i=0; i<size(); i++)
+		for (uint32_t i=0; i<size(); i++)
 			if((*this)[i] != r[i])
 				return false;
 		return true;
@@ -130,7 +134,7 @@ public:
 	}
 
 	void clear() {
-		for (int i = begin; i != end; i++)
+		for (uint32_t i = begin; i != end; i++)
 			arr[i&mask].~T();
 		begin = end = 0;
 	}
@@ -163,7 +167,9 @@ private:
 		size_t newSize = mp1 * 2;
 		if (newSize > max_size()) throw std::bad_alloc();
 		//printf("Growing to %lld (%u-%u mask %u)\n", (long long)newSize, begin, end, mask);
-		T *newArr = (T*)aligned_alloc(__alignof(T), newSize*sizeof(T));   // SOMEDAY: FastAllocator, exception safety
+		T* newArr = (T*)aligned_alloc(std::max(__alignof(T), sizeof(void*)),
+		                              newSize * sizeof(T)); // SOMEDAY: FastAllocator, exception safety
+		ASSERT(newArr != nullptr);
 		for (int i = begin; i != end; i++) {
 			new (&newArr[i - begin]) T(std::move(arr[i&mask]));
 			arr[i&mask].~T();

@@ -142,7 +142,7 @@ const KeyRange serverTagHistoryRangeBefore( UID serverID, Version version ) {
 	wr.serializeBytes( serverTagHistoryKeys.begin );
 	wr << serverID;
 	version = bigEndian64(version);
-	
+
 	Key versionStr = makeString( 8 );
 	uint8_t* data = mutateString( versionStr );
 	memcpy(data, &version, 8);
@@ -173,7 +173,7 @@ Version decodeServerTagHistoryKey( KeyRef const& key ) {
 Tag decodeServerTagValue( ValueRef const& value ) {
 	Tag s;
 	BinaryReader reader( value, IncludeVersion() );
-	if( reader.protocolVersion() < 0x0FDB00A560010001LL ) {
+	if(!reader.protocolVersion().hasTagLocality()) {
 		int16_t id;
 		reader >> id;
 		if(id == invalidTagOld) {
@@ -434,6 +434,9 @@ const KeyRangeRef fdbClientInfoPrefixRange(LiteralStringRef("\xff\x02/fdbClientI
 const KeyRef fdbClientInfoTxnSampleRate = LiteralStringRef("\xff\x02/fdbClientInfo/client_txn_sample_rate/");
 const KeyRef fdbClientInfoTxnSizeLimit = LiteralStringRef("\xff\x02/fdbClientInfo/client_txn_size_limit/");
 
+// ConsistencyCheck settings
+const KeyRef fdbShouldConsistencyCheckBeSuspended = LiteralStringRef("\xff\x02/ConsistencyCheck/Suspend");
+
 // Request latency measurement key
 const KeyRef latencyBandConfigKey = LiteralStringRef("\xff\x02/latencyBandConfig");
 
@@ -483,7 +486,7 @@ Key logRangesEncodeKey(KeyRef keyBegin, UID logUid) {
 // Returns the start key and optionally the logRange Uid
 KeyRef logRangesDecodeKey(KeyRef key, UID* logUid) {
 	if (key.size() < logRangesRange.begin.size() + sizeof(UID)) {
-		TraceEvent(SevError, "InvalidDecodeKey").detail("Key", printable(key));
+		TraceEvent(SevError, "InvalidDecodeKey").detail("Key", key);
 		ASSERT(false);
 	}
 
@@ -610,6 +613,8 @@ const Key restoreWorkerKeyFor( UID const& agentID ) {
 }
 
 const KeyRef healthyZoneKey = LiteralStringRef("\xff\x02/healthyZone");
+const StringRef ignoreSSFailuresZoneString = LiteralStringRef("IgnoreSSFailures");
+const KeyRef rebalanceDDIgnoreKey = LiteralStringRef("\xff\x02/rebalanceDDIgnored");
 
 const Value healthyZoneValue( StringRef const& zoneId, Version version ) {
 	BinaryWriter wr(IncludeVersion());
@@ -625,3 +630,8 @@ std::pair<Key,Version> decodeHealthyZoneValue( ValueRef const& value) {
 	reader >> version;
 	return std::make_pair(zoneId, version);
 }
+
+const KeyRangeRef testOnlyTxnStateStorePrefixRange(
+    LiteralStringRef("\xff/TESTONLYtxnStateStore/"),
+    LiteralStringRef("\xff/TESTONLYtxnStateStore0")
+);

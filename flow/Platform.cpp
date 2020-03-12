@@ -107,6 +107,7 @@
 #include <sys/uio.h>
 #include <sys/syslimits.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
 #include <sys/param.h>
 #include <sys/mount.h>
 #include <sys/sysctl.h>
@@ -132,12 +133,12 @@ std::string removeWhitespace(const std::string &t)
 	if (found != std::string::npos)
 		str.erase(found + 1);
 	else
-		str.clear();			// str is all whitespace
+		str.clear(); // str is all whitespace
 	found = str.find_first_not_of(ws);
 	if (found != std::string::npos)
 		str.erase(0, found);
 	else
-		str.clear();			// str is all whitespace
+		str.clear(); // str is all whitespace
 
 	return str;
 }
@@ -517,13 +518,13 @@ const char* getInterfaceName(const IPAddress& _ip) {
 		if(!iter->ifa_addr)
 			continue;
 		if (iter->ifa_addr->sa_family == AF_INET && _ip.isV4()) {
-			uint32_t ip = ntohl(((struct sockaddr_in*)iter->ifa_addr)->sin_addr.s_addr);
+			uint32_t ip = ntohl((reinterpret_cast<struct sockaddr_in*>(iter->ifa_addr))->sin_addr.s_addr);
 			if (ip == _ip.toV4()) {
 				ifa_name = iter->ifa_name;
 				break;
 			}
 		} else if (iter->ifa_addr->sa_family == AF_INET6 && _ip.isV6()) {
-			struct sockaddr_in6* ifa_addr = (struct sockaddr_in6*)iter->ifa_addr;
+			struct sockaddr_in6* ifa_addr = reinterpret_cast<struct sockaddr_in6*>(iter->ifa_addr);
 			if (memcmp(_ip.toV6().data(), &ifa_addr->sin6_addr, 16) == 0) {
 				ifa_name = iter->ifa_name;
 				break;
@@ -838,8 +839,6 @@ void getDiskStatistics(std::string const& directory, uint64_t& currentIOs, uint6
 	busyTicks = 0;
 	writeSectors = 0;
 	readSectors = 0;
-
-	const int kMaxDiskNameSize = 64;
 
 	struct statfs buf;
 	if (statfs(directory.c_str(), &buf)) {
@@ -1213,7 +1212,7 @@ SystemStatistics getSystemStatistics(std::string dataFolder, const IPAddress* ip
 	uint64_t nowBusyTicks = (*statState)->lastBusyTicks;
 	uint64_t nowReads = (*statState)->lastReads;
 	uint64_t nowWrites = (*statState)->lastWrites;
-	uint64_t nowWriteSectors = (*statState)->lastWriteSectors; 
+	uint64_t nowWriteSectors = (*statState)->lastWriteSectors;
 	uint64_t nowReadSectors = (*statState)->lastReadSectors;
 
 	if(dataFolder != "") {
@@ -1392,7 +1391,7 @@ void getLocalTime(const time_t *timep, struct tm *result) {
 }
 
 void setMemoryQuota( size_t limit ) {
-#if defined(USE_ASAN)
+#if defined(USE_SANITIZER)
 	// ASAN doesn't work with memory quotas: https://github.com/google/sanitizers/wiki/AddressSanitizer#ulimit--v
 	return;
 #endif
@@ -1499,7 +1498,6 @@ static void enableLargePages() {
 }
 
 static void *allocateInternal(size_t length, bool largePages) {
-	void *block = NULL;
 
 #ifdef _WIN32
 	DWORD allocType = MEM_COMMIT|MEM_RESERVE;
@@ -1609,12 +1607,12 @@ int getRandomSeed() {
 		}
 	} while (randomSeed == 0 && retryCount < FLOW_KNOBS->RANDOMSEED_RETRY_LIMIT);	// randomSeed cannot be 0 since we use mersenne twister in DeterministicRandom. Get a new one if randomSeed is 0.
 #else
-	int devRandom = open("/dev/urandom", O_RDONLY);
+	int devRandom = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
 	do {
 		retryCount++;
 		if (read(devRandom, &randomSeed, sizeof(randomSeed)) != sizeof(randomSeed) ) {
 			TraceEvent(SevError, "OpenURandom").GetLastError();
-			throw platform_error();	
+			throw platform_error();
 		}
 	} while (randomSeed == 0 && retryCount < FLOW_KNOBS->RANDOMSEED_RETRY_LIMIT);
 	close(devRandom);
@@ -1626,7 +1624,7 @@ int getRandomSeed() {
 	}
 	return randomSeed;
 }
-}; // namespace platform
+} // namespace platform
 
 std::string joinPath( std::string const& directory, std::string const& filename ) {
 	auto d = directory;
@@ -1662,13 +1660,21 @@ void renameFile( std::string const& fromPath, std::string const& toPath ) {
 	throw io_error();
 }
 
+#if defined(__linux__)
+#define FOPEN_CLOEXEC_MODE "e"
+#elif defined(_WIN32)
+#define FOPEN_CLOEXEC_MODE "N"
+#else
+#define FOPEN_CLOEXEC_MODE ""
+#endif
+
 void atomicReplace( std::string const& path, std::string const& content, bool textmode ) {
 	FILE* f = 0;
 	try {
 		INJECT_FAULT( io_error, "atomicReplace" );
 
-		std::string tempfilename = joinPath(parentDirectory(path), g_random->randomUniqueID().toString() + ".tmp");
-		f = textmode ? fopen( tempfilename.c_str(), "wt" ) : fopen(tempfilename.c_str(), "wb");
+		std::string tempfilename = joinPath(parentDirectory(path), deterministicRandom()->randomUniqueID().toString() + ".tmp");
+		f = textmode ? fopen( tempfilename.c_str(), "wt" FOPEN_CLOEXEC_MODE ) : fopen(tempfilename.c_str(), "wb");
 		if(!f)
 			throw io_error();
 	#ifdef _WIN32
@@ -1780,7 +1786,7 @@ bool deleteFile( std::string const& filename ) {
 #endif
 	Error e = systemErrorCodeToError();
 	TraceEvent(SevError, "DeleteFile").detail("Filename", filename).GetLastError().error(e);
-	throw errno;
+	throw e;
 }
 
 static void createdDirectory() { INJECT_FAULT( platform_error, "createDirectory" ); }
@@ -1834,7 +1840,7 @@ bool createDirectory( std::string const& directory ) {
 #endif
 }
 
-}; // namespace platform
+} // namespace platform
 
 const uint8_t separatorChar = CANONICAL_PATH_SEPARATOR;
 StringRef separator(&separatorChar, 1);
@@ -1878,18 +1884,6 @@ std::string cleanPath(std::string const &path) {
 	return result.empty() ? "." : result;
 }
 
-// Removes the last component from a path string (if possible) and returns the result with one trailing separator.
-// If there is only one path component, the result will be "" for relative paths and "/" for absolute paths.
-// Note that this is NOT the same as getting the parent of path, as the final component could be ".."
-// or "." and it would still be simply removed.
-// ALL of the following inputs will yield the result "/a/"
-//   /a/b
-//   /a/b/
-//   /a/..
-//   /a/../
-//   /a/.
-//   /a/./
-//   /a//..//
 std::string popPath(const std::string &path) {
 	int i = path.size() - 1;
 	// Skip over any trailing separators
@@ -2134,9 +2128,9 @@ void findFilesRecursively(std::string path, std::vector<std::string> &out) {
 		if(dir != "." && dir != "..")
 			findFilesRecursively(joinPath(path, dir), out);
 	}
-};
+}
 
-}; // namespace platform
+} // namespace platform
 
 
 void threadSleep( double seconds ) {
@@ -2174,7 +2168,20 @@ void makeTemporary( const char* filename ) {
 	SetFileAttributes(filename, FILE_ATTRIBUTE_TEMPORARY);
 #endif
 }
-}; // namespace platform
+
+void setCloseOnExec( int fd ) {
+#if defined(__unixish__)
+	int options = fcntl(fd, F_GETFD);
+	if (options != -1) {
+		options = fcntl(fd, F_SETFD, options | FD_CLOEXEC);
+	}
+	if (options == -1) {
+		TraceEvent(SevWarnAlways, "PlatformSetCloseOnExecError").suppressFor(60).GetLastError();
+	}
+#endif
+}
+
+} // namespace platform
 
 #ifdef _WIN32
 THREAD_HANDLE startThread(void (*func) (void *), void *arg) {
@@ -2209,7 +2216,7 @@ void deprioritizeThread() {
 }
 
 bool fileExists(std::string const& filename) {
-	FILE* f = fopen(filename.c_str(), "rb");
+	FILE* f = fopen(filename.c_str(), "rb" FOPEN_CLOEXEC_MODE );
 	if (!f) return false;
 	fclose(f);
 	return true;
@@ -2248,7 +2255,7 @@ int64_t fileSize(std::string const& filename) {
 
 std::string readFileBytes( std::string const& filename, int maxSize ) {
 	std::string s;
-	FILE* f = fopen(filename.c_str(), "rb");
+	FILE* f = fopen(filename.c_str(), "rb" FOPEN_CLOEXEC_MODE);
 	if (!f) throw file_not_readable();
 	try {
 		fseek(f, 0, SEEK_END);
@@ -2268,7 +2275,7 @@ std::string readFileBytes( std::string const& filename, int maxSize ) {
 }
 
 void writeFileBytes(std::string const& filename, const uint8_t* data, size_t count) {
-	FILE* f = fopen(filename.c_str(), "wb");
+	FILE* f = fopen(filename.c_str(), "wb" FOPEN_CLOEXEC_MODE);
 	if (!f)
 	{
 		TraceEvent(SevError, "WriteFileBytes").detail("Filename", filename).GetLastError();
@@ -2358,7 +2365,7 @@ std::string getWorkingDirectory() {
 	return result;
 }
 
-}; // namespace platform
+} // namespace platform
 
 extern std::string format( const char *form, ... );
 
@@ -2382,7 +2389,7 @@ std::string getDefaultPluginPath( const char* plugin_name ) {
 	#error Port me!
 #endif
 }
-}; // namespace platform
+} // namespace platform
 
 #ifdef ALLOC_INSTRUMENTATION
 #define TRACEALLOCATOR( size ) TraceEvent("MemSample").detail("Count", FastAllocator<size>::getApproximateMemoryUnused()/size).detail("TotalSize", FastAllocator<size>::getApproximateMemoryUnused()).detail("SampleCount", 1).detail("Hash", "FastAllocatedUnused" #size ).detail("Bt", "na")
@@ -2480,6 +2487,7 @@ void outOfMemory() {
 	TRACEALLOCATOR(16);
 	TRACEALLOCATOR(32);
 	TRACEALLOCATOR(64);
+	TRACEALLOCATOR(96);
 	TRACEALLOCATOR(128);
 	TRACEALLOCATOR(256);
 	TRACEALLOCATOR(512);
@@ -2492,7 +2500,7 @@ void outOfMemory() {
 
 	criticalError(FDB_EXIT_NO_MEM, "OutOfMemory", "Out of memory");
 }
-}; // namespace platform
+} // namespace platform
 
 extern "C" void criticalError(int exitCode, const char *type, const char *message) {
 	// Be careful!  This function may be called asynchronously from a thread or in other weird conditions
@@ -2618,14 +2626,14 @@ std::string get_backtrace() {
 	size_t size = raw_backtrace(addresses, 50);
 	return format_backtrace(addresses, size);
 }
-}; // namespace platform
+} // namespace platform
 #else
 
 namespace platform {
 std::string get_backtrace() { return std::string(); }
 std::string format_backtrace(void **addresses, int numAddresses) { return std::string(); }
 void* getImageOffset() { return NULL; }
-}; // namespace platform
+} // namespace platform
 #endif
 
 bool isLibraryLoaded(const char* lib_path) {
@@ -2682,6 +2690,56 @@ void* loadFunction(void* lib, const char* func_name) {
 #endif
 
 	return dlfcn;
+}
+
+void closeLibrary(void* handle) {
+#ifdef __unixish__
+	dlclose(handle);
+#else
+	FreeLibrary(reinterpret_cast<HMODULE>(handle));
+#endif
+}
+
+std::string exePath() {
+#if defined(__linux__)
+	std::unique_ptr<char[]> buf(new char[PATH_MAX]);
+	auto len = readlink("/proc/self/exe", buf.get(), PATH_MAX);
+	if (len > 0 && len < PATH_MAX) {
+		buf[len] = '\0';
+		return std::string(buf.get());
+	} else {
+		throw platform_error();
+	}
+#elif defined(__APPLE__)
+	uint32_t bufSize = 1024;
+	std::unique_ptr<char[]> buf(new char[bufSize]);
+	while (true) {
+		auto res = _NSGetExecutablePath(buf.get(), &bufSize);
+		if (res == -1) {
+			buf.reset(new char[bufSize]);
+		} else {
+			return std::string(buf.get());
+		}
+	}
+#elif defined(_WIN32)
+	DWORD bufSize = 1024;
+	std::unique_ptr<char[]> buf(new char[bufSize]);
+	while (true) {
+		auto s = GetModuleFileName(nullptr, buf.get(), bufSize);
+		if (s >= 0) {
+			if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+				bufSize *= 2;
+				buf.reset(new char[bufSize]);
+				continue;
+			}
+			return std::string(buf.get());
+		} else {
+			throw platform_error();
+		}
+	}
+#else
+#  error Port me!
+#endif
 }
 
 void platformInit() {
@@ -2745,17 +2803,18 @@ extern volatile size_t net2backtraces_offset;
 extern volatile size_t net2backtraces_max;
 extern volatile bool net2backtraces_overflow;
 extern volatile int net2backtraces_count;
-extern volatile double net2liveness;
+extern std::atomic<int64_t> net2liveness;
 extern volatile thread_local int profilingEnabled;
 extern void initProfiling();
 
+std::atomic<double> checkThreadTime;
 volatile thread_local bool profileThread = false;
 #endif
 
 volatile thread_local int profilingEnabled = 1;
 
-void setProfilingEnabled(int enabled) { 
-	profilingEnabled = enabled; 
+void setProfilingEnabled(int enabled) {
+	profilingEnabled = enabled;
 }
 
 void profileHandler(int sig) {
@@ -2773,7 +2832,9 @@ void profileHandler(int sig) {
 	// We are casting away the volatile-ness of the backtrace array, but we believe that should be reasonably safe in the signal handler
 	ProfilingSample* ps = const_cast<ProfilingSample*>((volatile ProfilingSample*)(net2backtraces + net2backtraces_offset));
 
-	ps->timestamp = timer();
+	// We can only read the check thread time in a signal handler if the atomic is lock free.
+	// We can't get the time from a timer() call because it's not signal safe.
+	ps->timestamp = checkThreadTime.is_lock_free() ? checkThreadTime.load() : 0;
 
 	// SOMEDAY: should we limit the maximum number of frames from
 	// backtrace beyond just available space?
@@ -2792,12 +2853,13 @@ void* checkThread(void *arg) {
 	pthread_t mainThread = *(pthread_t*)arg;
 	free(arg);
 
-	double lastValue = net2liveness;
+	int64_t lastValue = net2liveness.load();
 	double lastSignal = 0;
 	double logInterval = FLOW_KNOBS->SLOWTASK_PROFILING_INTERVAL;
 	while(true) {
 		threadSleep(FLOW_KNOBS->SLOWTASK_PROFILING_INTERVAL);
-		if(lastValue == net2liveness) {
+		int64_t currentLiveness = net2liveness.load();
+		if(lastValue == currentLiveness) {
 			double t = timer();
 			if(lastSignal == 0 || t - lastSignal >= logInterval) {
 				if(lastSignal > 0) {
@@ -2805,14 +2867,15 @@ void* checkThread(void *arg) {
 				}
 
 				lastSignal = t;
+				checkThreadTime.store(lastSignal);
 				pthread_kill(mainThread, SIGPROF);
 			}
 		}
 		else {
+			lastValue = currentLiveness;
 			lastSignal = 0;
 			logInterval = FLOW_KNOBS->SLOWTASK_PROFILING_INTERVAL;
 		}
-		lastValue = net2liveness;
 	}
 	return NULL;
 #else
@@ -2820,6 +2883,22 @@ void* checkThread(void *arg) {
 	return NULL;
 #endif
 }
+
+#if defined(DTRACE_PROBES)
+void fdb_probe_actor_create(const char* name, unsigned long id) {
+	FDB_TRACE_PROBE(actor_create, name, id);
+}
+void fdb_probe_actor_destroy(const char* name, unsigned long id) {
+	FDB_TRACE_PROBE(actor_destroy, name, id);
+}
+void fdb_probe_actor_enter(const char* name, unsigned long id, int index) {
+	FDB_TRACE_PROBE(actor_enter, name, id, index);
+}
+void fdb_probe_actor_exit(const char* name, unsigned long id, int index) {
+	FDB_TRACE_PROBE(actor_exit, name, id, index);
+}
+#endif
+
 
 void setupSlowTaskProfiler() {
 #ifdef __linux__
@@ -2843,28 +2922,6 @@ void setupSlowTaskProfiler() {
 	// No slow task profiling for other platforms!
 #endif
 }
-
-#ifdef __linux__
-// There's no good place to put this, so it's here.
-// Ubuntu's packaging of libstdc++_pic offers different symbols than libstdc++.  Go figure.
-// Notably, it's missing a definition of std::istream::ignore(long), which causes compilation errors
-// in the bindings.  Thus, we provide weak versions of their definitions, so that if the
-// linked-against libstdc++ is missing their definitions, we'll be able to use the provided
-// ignore(long, int) version.
-#include <istream>
-namespace std {
-typedef basic_istream<char, std::char_traits<char>> char_basic_istream;
-template <>
-char_basic_istream& __attribute__((weak)) char_basic_istream::ignore(streamsize count) {
-  return ignore(count, std::char_traits<char>::eof());
-}
-typedef basic_istream<wchar_t, std::char_traits<wchar_t>> wchar_basic_istream;
-template <>
-wchar_basic_istream& __attribute__((weak)) wchar_basic_istream::ignore(streamsize count) {
-  return ignore(count, std::char_traits<wchar_t>::eof());
-}
-}
-#endif
 
 // UnitTest for getMemoryInfo
 #ifdef __linux__
@@ -3003,7 +3060,7 @@ int testPathFunction2(const char *name, std::function<std::string(std::string, b
 		printf("SKIPPED: %s('%s', %d, %d)\n", name, a.c_str(), resolveLinks, mustExist);
 		return 0;
 	}
-	
+
 	ErrorOr<std::string> result;
 	try { result  = fun(a, resolveLinks, mustExist); } catch(Error &e) { result = e; }
 	bool r = result.isError() == b.isError() && (b.isError() || b.get() == result.get()) && (!b.isError() || b.getError().code() == result.getError().code());
