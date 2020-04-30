@@ -1820,16 +1820,29 @@ bool createDirectory( std::string const& directory ) {
 		if ( mkdir( directory.substr(0, sep).c_str(), 0755 ) != 0 ) {
 			if (errno == EEXIST)
 				continue;
+			auto mkdirErrno = errno;
+
+			// check if directory already exists
+			// necessary due to old kernel bugs
+			struct stat s;
+			const char* dirname = directory.c_str();
+			if (stat(dirname, &s) != -1 && S_ISDIR(s.st_mode)) {
+				TraceEvent("DirectoryAlreadyExists").detail("Directory", dirname).detail("IgnoredError", mkdirErrno);
+				continue;
+			}
 
 			Error e;
-			if(errno == EACCES) {
+			if (mkdirErrno == EACCES) {
 				e = file_not_writable();
-			}
-			else {
+			} else {
 				e = systemErrorCodeToError();
 			}
 
-			TraceEvent(SevError, "CreateDirectory").detail("Directory", directory).GetLastError().error(e);
+			TraceEvent(SevError, "CreateDirectory")
+			    .detail("Directory", directory)
+			    .detailf("UnixErrorCode", "%x", errno)
+			    .detail("UnixError", strerror(mkdirErrno))
+			    .error(e);
 			throw e;
 		}
 		createdDirectory();
@@ -2369,25 +2382,27 @@ std::string getWorkingDirectory() {
 
 extern std::string format( const char *form, ... );
 
-
 namespace platform {
-
-std::string getDefaultPluginPath( const char* plugin_name ) {
+std::string getDefaultConfigPath() {
 #ifdef _WIN32
-	std::string installPath;
-	if(!platform::getEnvironmentVar("FOUNDATIONDB_INSTALL_PATH", installPath)) {
-		// This is relying of the DLL search order to load the plugin,
-		//  starting in the same directory as the executable.
-		return plugin_name;
+	TCHAR szPath[MAX_PATH];
+	if( SHGetFolderPath(NULL, CSIDL_COMMON_APPDATA, NULL, 0, szPath)  != S_OK ) {
+		TraceEvent(SevError, "WindowsAppDataError").GetLastError();
+		throw platform_error();
 	}
-	return format( "%splugins\\%s.dll", installPath.c_str(), plugin_name );
+	std::string _filepath(szPath);
+	return _filepath + "\\foundationdb";
 #elif defined(__linux__)
-	return format( "/usr/lib/foundationdb/plugins/%s.so", plugin_name );
+	return "/etc/foundationdb";
 #elif defined(__APPLE__)
-	return format( "/usr/local/foundationdb/plugins/%s.dylib", plugin_name );
+	return "/usr/local/etc/foundationdb";
 #else
 	#error Port me!
 #endif
+}
+
+std::string getDefaultClusterFilePath() {
+	return joinPath(getDefaultConfigPath(), "fdb.cluster");
 }
 } // namespace platform
 

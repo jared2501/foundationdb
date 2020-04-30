@@ -91,10 +91,10 @@ ACTOR Future<Void> traceCounters(std::string traceEventName, UID traceEventID, d
 		counters->logToTraceEvent(te);
 
 		if (!trackLatestName.empty()) {
-			te.trackLatest(trackLatestName.c_str());
+			te.trackLatest(trackLatestName);
 		}
 
 		last_interval = now();
-		wait(delay(interval));
+		wait(delay(interval, TaskPriority::FlushTrace));
 	}
 }

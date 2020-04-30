@@ -43,7 +43,7 @@ inline int fastrand() {
 //inline static bool TRACE_SAMPLE() { return fastrand()<16; }
 inline static bool TRACE_SAMPLE() { return false; }
 
-extern thread_local int g_trace_depth;
+extern thread_local int g_allocation_tracing_disabled;
 
 enum Severity {
 	SevSample=1,
@@ -79,6 +79,8 @@ public:
 	int getInt(std::string key, bool permissive=false) const;
 	int64_t getInt64(std::string key, bool permissive=false) const;
 	double getDouble(std::string key, bool permissive=false) const;
+
+	Field &mutate(int index);
 
 	std::string toString() const;
 	void validateFormat() const;
@@ -373,10 +375,14 @@ struct SpecialTraceMetricType
 TRACE_METRIC_TYPE(double, double);
 
 struct TraceEvent {
+	TraceEvent();
 	TraceEvent( const char* type, UID id = UID() );   // Assumes SevInfo severity
 	TraceEvent( Severity, const char* type, UID id = UID() );
 	TraceEvent( struct TraceInterval&, UID id = UID() );
 	TraceEvent( Severity severity, struct TraceInterval& interval, UID id = UID() );
+
+	TraceEvent( TraceEvent &&ev );
+	TraceEvent& operator=( TraceEvent &&ev );
 
 	static void setNetworkThread();
 	static bool isNetworkThread();
@@ -446,7 +452,7 @@ private:
 	TraceEvent& detailImpl( std::string&& key, std::string&& value, bool writeEventMetricField=true );
 public:
 	TraceEvent& backtrace(const std::string& prefix = "");
-	TraceEvent& trackLatest( const char* trackingKey );
+	TraceEvent& trackLatest(const std::string& trackingKey );
 	TraceEvent& sample( double sampleRate, bool logSampleRate=true );
 
 	// Sets the maximum length a field can be before it gets truncated. A value of 0 uses the default, a negative value
@@ -489,6 +495,7 @@ private:
 
 	int maxFieldLength;
 	int maxEventLength;
+	int timeIndex;
 
 	void setSizeLimits();
 
@@ -551,6 +558,16 @@ private:
 };
 
 extern LatestEventCache latestEventCache;
+
+struct EventCacheHolder : public ReferenceCounted<EventCacheHolder> {
+	std::string trackingKey;
+
+	EventCacheHolder(const std::string& trackingKey) : trackingKey(trackingKey) {}
+
+	~EventCacheHolder() {
+		latestEventCache.clear(trackingKey);
+	}
+};
 
 // Evil but potentially useful for verbose messages:
 #if CENABLED(0, NOT_IN_CLEAN)

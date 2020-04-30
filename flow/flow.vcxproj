@@ -13,6 +13,7 @@
   <ItemGroup>
     <ActorCompiler Include="ActorCollection.actor.cpp" />
     <ActorCompiler Include="CompressedInt.actor.cpp" />
+    <ClCompile Include="Arena.cpp" />
     <ClCompile Include="DeterministicRandom.cpp" />
     <ClCompile Include="Deque.cpp" />
     <ClCompile Include="Error.cpp" />
@@ -49,6 +50,7 @@
     <ClCompile Include="version.cpp" />
     <ClCompile Include="SignalSafeUnwind.cpp" />
     <ClCompile Include="serialize.cpp" />
+    <ActorCompiler Include="TLSConfig.actor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CompressedInt.h" />
@@ -92,6 +94,9 @@
     <ClInclude Include="Platform.h" />
     <ClInclude Include="ThreadSafeQueue.h" />
     <ClInclude Include="Trace.h" />
+    <ActorCompiler Include="TLSConfig.actor.h" >
+      <EnableCompile>false</EnableCompile>
+    </ActorCompiler>
     <ClInclude Include="SignalSafeUnwind.h" />
     <ClInclude Include="UnitTest.h" />
     <ActorCompiler Include="ThreadHelper.actor.h">

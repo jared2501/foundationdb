@@ -82,9 +82,9 @@ public:
 	int64_t DISK_QUEUE_FILE_EXTENSION_BYTES; // When we grow the disk queue, by how many bytes should it grow?
 	int64_t DISK_QUEUE_FILE_SHRINK_BYTES; // When we shrink the disk queue, by how many bytes should it shrink?
 	int DISK_QUEUE_MAX_TRUNCATE_BYTES;  // A truncate larger than this will cause the file to be replaced instead.
-	int TLOG_DEGRADED_DELAY_COUNT;
 	double TLOG_DEGRADED_DURATION;
 	double TXS_POPPED_MAX_DELAY;
+	double TLOG_MAX_CREATE_DURATION;
 
 	// Data distribution queue
 	double HEALTH_POLL_TIME;
@@ -105,6 +105,7 @@ public:
 	double INFLIGHT_PENALTY_REDUNDANT;
 	double INFLIGHT_PENALTY_UNHEALTHY;
 	double INFLIGHT_PENALTY_ONE_LEFT;
+	bool USE_OLD_NEEDED_SERVERS;
 	
 	// Higher priorities are executed first
 	// Priority/100 is the "priority group"/"superpriority".  Priority inversion
@@ -118,6 +119,7 @@ public:
 	int PRIORITY_TEAM_CONTAINS_UNDESIRED_SERVER;
 	int PRIORITY_TEAM_REDUNDANT;
 	int PRIORITY_MERGE_SHARD;
+	int PRIORITY_POPULATE_REGION;
 	int PRIORITY_TEAM_UNHEALTHY;
 	int PRIORITY_TEAM_2_LEFT;
 	int PRIORITY_TEAM_1_LEFT;
@@ -150,8 +152,7 @@ public:
 	double DD_MERGE_COALESCE_DELAY;
 	double STORAGE_METRICS_POLLING_DELAY;
 	double STORAGE_METRICS_RANDOM_DELAY;
-	double FREE_SPACE_RATIO_CUTOFF;
-	double FREE_SPACE_RATIO_DD_CUTOFF;
+	double AVAILABLE_SPACE_RATIO_CUTOFF;
 	int DESIRED_TEAMS_PER_SERVER;
 	int MAX_TEAMS_PER_SERVER;
 	int64_t DD_SHARD_SIZE_GRANULARITY;
@@ -166,6 +167,7 @@ public:
 	int DD_OVERLAP_PENALTY;
 	bool DD_VALIDATE_LOCALITY;
 	int DD_CHECK_INVALID_LOCALITY_DELAY;
+	bool DD_ENABLE_VERBOSE_TRACING;
 
 	// TeamRemover to remove redundant teams
 	bool TR_FLAG_DISABLE_MACHINE_TEAM_REMOVER; // disable the machineTeamRemover actor
@@ -238,6 +240,8 @@ public:
 	double START_TRANSACTION_BATCH_QUEUE_CHECK_INTERVAL;
 	double START_TRANSACTION_MAX_TRANSACTIONS_TO_START;
 	int START_TRANSACTION_MAX_REQUESTS_TO_START;
+	int START_TRANSACTION_MAX_QUEUE_SIZE;
+	int KEY_LOCATION_MAX_QUEUE_SIZE;
 
 	double COMMIT_TRANSACTION_BATCH_INTERVAL_FROM_IDLE;
 	double COMMIT_TRANSACTION_BATCH_INTERVAL_MIN;
@@ -264,6 +268,10 @@ public:
 	double REQUIRED_MIN_RECOVERY_DURATION;
 	bool ALWAYS_CAUSAL_READ_RISKY;
 	int MAX_COMMIT_UPDATES;
+	double MIN_PROXY_COMPUTE;
+	double MAX_PROXY_COMPUTE;
+	int PROXY_COMPUTE_BUCKETS;
+	double PROXY_COMPUTE_GROWTH_RATE;
 
 	// Master Server
 	double COMMIT_SLEEP_TIME;
@@ -364,8 +372,10 @@ public:
 
 	double MAX_TRANSACTIONS_PER_BYTE;
 
-	int64_t MIN_FREE_SPACE;
-	double MIN_FREE_SPACE_RATIO;
+	int64_t MIN_AVAILABLE_SPACE;
+	double MIN_AVAILABLE_SPACE_RATIO;
+	double TARGET_AVAILABLE_SPACE_RATIO;
+	double AVAILABLE_SPACE_UPDATE_DELAY;
 
 	double MAX_TL_SS_VERSION_DIFFERENCE; // spring starts at half this value
 	double MAX_TL_SS_VERSION_DIFFERENCE_BATCH;

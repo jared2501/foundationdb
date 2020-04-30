@@ -208,6 +208,9 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
                },
                "megabits_received":{
                   "hz":0.0
+               },
+               "tls_policy_failures":{
+                 "hz":0.0
                }
             },
             "run_loop_busy":0.2
@@ -425,6 +428,7 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
          },
          "required_logs":3,
          "missing_logs":"7f8d623d0cb9966e",
+         "active_generations":1,
          "description":"Recovery complete."
       },
       "workload":{
@@ -440,6 +444,16 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
                "roughness":0.0
             },
             "read_requests":{
+               "hz":0.0,
+               "counter":0,
+               "roughness":0.0
+            },
+            "location_requests":{
+               "hz":0.0,
+               "counter":0,
+               "roughness":0.0
+            },
+            "memory_errors":{
                "hz":0.0,
                "counter":0,
                "roughness":0.0
@@ -594,6 +608,7 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
                   "missing_data",
                   "healing",
                   "optimizing_team_collections",
+                  "healthy_populating_region",
                   "healthy_repartitioning",
                   "healthy_removing_server",
                   "healthy_rebalancing",
@@ -628,6 +643,7 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
                           "missing_data",
                           "healing",
                           "optimizing_team_collections",
+                          "healthy_populating_region",
                           "healthy_repartitioning",
                           "healthy_removing_server",
                           "healthy_rebalancing",
