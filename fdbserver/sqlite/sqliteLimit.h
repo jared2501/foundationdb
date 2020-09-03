@@ -185,7 +185,7 @@
 ** max_page_count macro.
 */
 #ifndef SQLITE_MAX_PAGE_COUNT
-# define SQLITE_MAX_PAGE_COUNT 1073741823
+# define SQLITE_MAX_PAGE_COUNT 2147483646
 #endif
 
 /*
